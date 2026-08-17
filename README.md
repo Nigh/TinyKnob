@@ -1,8 +1,30 @@
-# pico USB CDC+HID template
-rpi pico USB CDC+HID template
+# TinyKnob
+
+RP2040-Zero + DRV8316 + MT6701 force-feedback knob.
 
 `PID=0x4005`
 `VID=0xACDC`
+
+## Wiring
+
+```
+RP2040-Zero          DRV8316
+GPIO2  ------------- PWM_A / INHA
+GPIO4  ------------- PWM_B / INHB
+GPIO6  ------------- PWM_C / INHC
+GND    ------------- GND
+
+RP2040-Zero          MT6701
+GPIO9  ------------- CSN
+GPIO10 ------------- CLK
+GPIO11 <------------ DO
+3V3    ------------- VCC
+GND    ------------- GND
+```
+
+DRV8316 is already in 3x PWM with nSLEEP held high in hardware. Motor is a 4015 gimbal, 11 pole pairs.
+
+Current-sense (SOA/SOB/SOC) is reserved for a later ADC current loop.
 
 ## Prepare
 

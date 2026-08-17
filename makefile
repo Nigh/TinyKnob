@@ -22,4 +22,5 @@ format:
 docker_build:
 	docker run --rm \
 	-v ${PWD}:/workspace \
-	xianii/pico-sdk:latest /bin/bash -c "cd pico-src && cmake . -G Ninja -Bbuild -S. && ninja -C build"
+	-w /workspace \
+	xianii/pico-sdk:latest /bin/bash -c "cmake . -G Ninja -Bbuild -S. && ninja -C build"

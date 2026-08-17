@@ -7,6 +7,7 @@
 
 #include "platform.h"
 #include "led_drv.h"
+#include "mt6701.h"
 
 #include "tusb_config.h"
 
@@ -51,6 +52,12 @@ void main_handler(uevt_t* evt) {
 	switch(evt->evt_id) {
 		case UEVT_TIMER_4HZ:
 			led_blink_routine();
+			{
+				mt6701_sample_t s;
+				if(mt6701_try_read(&s))
+					LOG_RAW("enc %u crc %d mg %u\n", s.angle, s.crc_ok, s.mg);
+				mt6701_start_read();
+			}
 			break;
 	}
 }
@@ -113,6 +120,7 @@ int main() {
 	user_event_handler_regist(main_handler);
 
 	ws2812_setup();
+	mt6701_setup();
 	struct repeating_timer timer;
 	add_repeating_timer_us(249978ul, timer_4hz_callback, NULL, &timer);
 	tusb_init();

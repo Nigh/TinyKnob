@@ -22,6 +22,7 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
 	pico_sync
 	hardware_sync
 	hardware_pio
+	hardware_pwm
 	hardware_dma
 	hardware_irq
 	hardware_xosc

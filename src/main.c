@@ -8,6 +8,7 @@
 #include "platform.h"
 #include "led_drv.h"
 #include "mt6701.h"
+#include "motor.h"
 
 #include "tusb_config.h"
 
@@ -121,6 +122,7 @@ int main() {
 
 	ws2812_setup();
 	mt6701_setup();
+	motor_setup();
 	struct repeating_timer timer;
 	add_repeating_timer_us(249978ul, timer_4hz_callback, NULL, &timer);
 	tusb_init();

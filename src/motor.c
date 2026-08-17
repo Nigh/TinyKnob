@@ -7,8 +7,7 @@
 #include "hardware/irq.h"
 #include <math.h>
 
-#define PI 3.14159265f
-#define RAD_PER_COUNT (2.f * PI / 16384.f)
+#define RAD_PER_COUNT (2.f * 3.14159265f / 16384.f)
 #define SQRT3_2 0.86602540378f
 #define COUNTS_PER_REV 16384
 
@@ -25,6 +24,9 @@ static int32_t pulse_pos0;
 static int32_t home_pos;
 static int32_t move_start;
 static int32_t move_target;
+static int32_t rest_pos;
+static float spring_k = SPRING_K;
+static int32_t pos_last;
 
 static bool have_enc;
 static uint16_t prev_raw;
@@ -67,6 +69,22 @@ void motor_get_state(motor_state_t* s) {
 	s->offset_mrad = (int32_t)(offset_rad * 1000.f);
 	s->dir = dir;
 	s->crc_fail = crc_fail;
+}
+
+void motor_set_spring_k(float k) {
+	if(k < 0.f)
+		k = 0.f;
+	if(k > 8.f)
+		k = 8.f;
+	spring_k = k;
+}
+
+void motor_set_rest_to_current(void) {
+	rest_pos = pos;
+}
+
+float motor_get_spring_k(void) {
+	return spring_k;
 }
 
 static void ingest_encoder(uint16_t raw) {
@@ -220,11 +238,26 @@ static void motor_isr(void) {
 			break;
 		case MOTOR_MOVE_REV:
 			if(follow_move()) {
-				ud_cmd = 0.f;
-				uq_cmd = 0.f;
-				enter_mode(MOTOR_IDLE);
+				rest_pos = home_pos;
+				pos_last = pos;
+				enter_mode(MOTOR_SPRING);
 			}
 			break;
+		case MOTOR_SPRING: {
+			int32_t d = rest_pos - pos;
+			d %= COUNTS_PER_REV;
+			if(d < 0)
+				d += COUNTS_PER_REV;
+			if(d > COUNTS_PER_REV / 2)
+				d -= COUNTS_PER_REV;
+			float err = (float)d * RAD_PER_COUNT;
+			float vel = (float)(pos - pos_last) * RAD_PER_COUNT * (float)PWM_HZ;
+			pos_last = pos;
+			ud_cmd = 0.f;
+			uq_cmd = clampf(spring_k * err - SPRING_D * vel, -UQ_MAX, UQ_MAX);
+			te_from_encoder = true;
+			break;
+		}
 		case MOTOR_IDLE:
 			ud_cmd = 0.f;
 			uq_cmd = 0.f;

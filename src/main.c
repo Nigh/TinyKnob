@@ -54,10 +54,10 @@ void main_handler(uevt_t* evt) {
 		case UEVT_TIMER_4HZ:
 			led_blink_routine();
 			{
-				mt6701_sample_t s;
-				if(mt6701_try_read(&s))
-					LOG_RAW("enc %u crc %d mg %u\n", s.angle, s.crc_ok, s.mg);
-				mt6701_start_read();
+				motor_state_t st;
+				motor_get_state(&st);
+				LOG_RAW("m %u pos %ld dir %d off %ld crc_fail %lu\n",
+						st.mode, (long)st.pos, st.dir, (long)st.offset_mrad, (unsigned long)st.crc_fail);
 			}
 			break;
 	}

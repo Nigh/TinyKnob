@@ -10,6 +10,7 @@
 #define PI 3.14159265f
 #define RAD_PER_COUNT (2.f * PI / 16384.f)
 #define SQRT3_2 0.86602540378f
+#define COUNTS_PER_REV 16384
 
 static uint pwm_wrap;
 static uint pwm_slice_a;
@@ -21,6 +22,9 @@ static volatile uint32_t crc_fail;
 static float offset_rad;
 static float align_theta_m;
 static int32_t pulse_pos0;
+static int32_t home_pos;
+static int32_t move_start;
+static int32_t move_target;
 
 static bool have_enc;
 static uint16_t prev_raw;
@@ -33,6 +37,14 @@ static bool te_from_encoder;
 
 static uint32_t ms_to_ticks(uint32_t ms) {
 	return (PWM_HZ * ms) / 1000u;
+}
+
+static float clampf(float x, float lo, float hi) {
+	if(x < lo)
+		return lo;
+	if(x > hi)
+		return hi;
+	return x;
 }
 
 static uint16_t duty_to_level(float d) {
@@ -102,6 +114,27 @@ static void apply_cmd(void) {
 static void enter_mode(uint8_t next) {
 	mode = next;
 	mode_tick = 0;
+}
+
+static void start_move(int32_t target, uint8_t next) {
+	move_start = pos;
+	move_target = target;
+	enter_mode(next);
+}
+
+static bool follow_move(void) {
+	uint32_t dur = ms_to_ticks(MOVE_REV_MS);
+	if(dur == 0)
+		dur = 1;
+	float t = (float)mode_tick / (float)dur;
+	if(t > 1.f)
+		t = 1.f;
+	int32_t target = move_start + (int32_t)((float)(move_target - move_start) * t);
+	float err = (float)(target - pos) * RAD_PER_COUNT;
+	ud_cmd = 0.f;
+	uq_cmd = clampf(err * POS_KP, -UQ_MAX, UQ_MAX);
+	te_from_encoder = true;
+	return mode_tick >= dur;
 }
 
 static void motor_isr(void) {
@@ -176,12 +209,22 @@ static void motor_isr(void) {
 			uq_cmd = 0.f;
 			te_from_encoder = true;
 			if(mode_tick >= ramp) {
+				home_pos = pos;
+				start_move(home_pos + COUNTS_PER_REV, MOTOR_MOVE_FWD);
+			}
+			break;
+		}
+		case MOTOR_MOVE_FWD:
+			if(follow_move())
+				start_move(home_pos, MOTOR_MOVE_REV);
+			break;
+		case MOTOR_MOVE_REV:
+			if(follow_move()) {
 				ud_cmd = 0.f;
 				uq_cmd = 0.f;
 				enter_mode(MOTOR_IDLE);
 			}
 			break;
-		}
 		case MOTOR_IDLE:
 			ud_cmd = 0.f;
 			uq_cmd = 0.f;

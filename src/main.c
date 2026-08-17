@@ -1,12 +1,15 @@
 
 #include "pico/stdlib.h"
 #include "hardware/sync.h"
+#include <string.h>
 
 #include "scheduler/uevent.h"
 #include "scheduler/scheduler.h"
 
 #include "platform.h"
 #include "led_drv.h"
+#include "mt6701.h"
+#include "motor.h"
 
 #include "tusb_config.h"
 
@@ -51,6 +54,12 @@ void main_handler(uevt_t* evt) {
 	switch(evt->evt_id) {
 		case UEVT_TIMER_4HZ:
 			led_blink_routine();
+			{
+				motor_state_t st;
+				motor_get_state(&st);
+				LOG_RAW("m %u pos %ld dir %d off %ld crc_fail %lu\n",
+						st.mode, (long)st.pos, st.dir, (long)st.offset_mrad, (unsigned long)st.crc_fail);
+			}
 			break;
 	}
 }
@@ -60,6 +69,10 @@ void uevt_log(char* str) {
 }
 
 const char printHex[] = "0123456789ABCDEF";
+#define HID_CMD_GET_STATE 0x10
+#define HID_CMD_SET_K 0x20
+#define HID_CMD_SET_REST 0x21
+
 void hid_receive(uint8_t const* buffer, uint16_t bufsize) {
 	char str[16 * 2 + 1];
 	str[32] = 0;
@@ -67,15 +80,50 @@ void hid_receive(uint8_t const* buffer, uint16_t bufsize) {
 		str[i * 2] = printHex[buffer[i] >> 4];
 		str[i * 2 + 1] = printHex[buffer[i] & 0xF];
 	}
-	// print first 32 bytes
 	LOG_RAW("HID[%d]:%s\n", bufsize, str);
 
-	uint8_t echo[64];
-	// echo back with every byte + 1
-	for (uint16_t i = 0; i < bufsize; i++) {
-		echo[i] = buffer[i] + 1;
+	if(bufsize < 1)
+		return;
+
+	uint8_t out[64];
+	memset(out, 0, sizeof(out));
+	switch(buffer[0]) {
+		case HID_CMD_GET_STATE: {
+			motor_state_t st;
+			motor_get_state(&st);
+			out[0] = HID_CMD_GET_STATE;
+			out[1] = st.mode;
+			out[2] = (uint8_t)st.dir;
+			out[3] = (uint8_t)st.pos;
+			out[4] = (uint8_t)(st.pos >> 8);
+			out[5] = (uint8_t)(st.pos >> 16);
+			out[6] = (uint8_t)(st.pos >> 24);
+			out[7] = (uint8_t)st.offset_mrad;
+			out[8] = (uint8_t)(st.offset_mrad >> 8);
+			out[9] = (uint8_t)(st.offset_mrad >> 16);
+			out[10] = (uint8_t)(st.offset_mrad >> 24);
+			out[11] = (uint8_t)(motor_get_spring_k() * 10.f);
+			hid_send(out, bufsize);
+			return;
+		}
+		case HID_CMD_SET_K:
+			if(bufsize >= 2)
+				motor_set_spring_k((float)buffer[1] / 10.f);
+			out[0] = HID_CMD_SET_K;
+			hid_send(out, bufsize);
+			return;
+		case HID_CMD_SET_REST:
+			motor_set_rest_to_current();
+			out[0] = HID_CMD_SET_REST;
+			hid_send(out, bufsize);
+			return;
+		default: {
+			for(uint16_t i = 0; i < bufsize; i++)
+				out[i] = buffer[i] + 1;
+			hid_send(out, bufsize);
+			return;
+		}
 	}
-	hid_send(echo, bufsize);
 }
 
 static char serial_fifo[16];
@@ -113,6 +161,8 @@ int main() {
 	user_event_handler_regist(main_handler);
 
 	ws2812_setup();
+	mt6701_setup();
+	motor_setup();
 	struct repeating_timer timer;
 	add_repeating_timer_us(249978ul, timer_4hz_callback, NULL, &timer);
 	tusb_init();

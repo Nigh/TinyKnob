@@ -7,6 +7,7 @@ add_executable(${PROJECT_NAME} main.c)
 
 file(GLOB SRC *.c)
 target_sources(${PROJECT_NAME} PUBLIC ${SRC})
+pico_generate_pio_header(${PROJECT_NAME} ${CMAKE_CURRENT_LIST_DIR}/mt6701/mt6701.pio)
 
 target_include_directories(${PROJECT_NAME} PUBLIC
 	${CMAKE_CURRENT_LIST_DIR}
@@ -21,6 +22,8 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
 	pico_sync
 	hardware_sync
 	hardware_pio
+	hardware_pwm
+	hardware_clocks
 	hardware_dma
 	hardware_irq
 	hardware_xosc

@@ -31,9 +31,12 @@
 #define TEST_UQ_MAX 0.65f
 // ponytail: open-loop Kv (V/(rad/s)); retune if TEST lags (Uq_ff ≈ lag_rad * POS_KP).
 #define TEST_KV 0.07f
-#define SPRING_K 0.04f
-#define SPRING_D 0.012f
-#define SPRING_UQ_MAX 0.05f
+// ponytail: K matches POS_KP (known to move). Uq max > DIR_PULSE (cogging), < TEST.
+// 20 kHz raw Δpos is 1ct≈7.7 rad/s — D must see LPF'd vel. Ceiling: lag on fast flicks; upgrade = encoder PLL.
+#define SPRING_K 0.6f
+#define SPRING_D 0.05f
+#define SPRING_UQ_MAX 0.35f
+#define SPRING_VEL_LP_HZ 50.f
 #define CRC_FAIL_TRIP 200u
 
 // ponytail: CSA/CSB/CSC not wired; ADC current loop later. Do not assign GPIOs until the analog traces exist.

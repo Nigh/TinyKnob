@@ -1,6 +1,7 @@
 #include "motor.h"
 #include "pins.h"
 #include "mt6701.h"
+#include "platform.h"
 #include "hardware/pwm.h"
 #include "hardware/clocks.h"
 #include "hardware/gpio.h"
@@ -14,6 +15,7 @@
 #define SIN_LUT_N 1024
 #define SIN_LUT_MASK (SIN_LUT_N - 1)
 #define PWM_MIN_MAG2 (PWM_MIN_MAG * PWM_MIN_MAG)
+#define SPRING_VEL_ALPHA (TWO_PI * SPRING_VEL_LP_HZ / (float)PWM_HZ)
 
 static float sin_lut[SIN_LUT_N];
 
@@ -42,6 +44,7 @@ static int32_t move_target;
 static int32_t rest_pos;
 static float spring_k = SPRING_K;
 static int32_t pos_last;
+static float vel_filt;
 
 static bool have_enc;
 static uint16_t prev_raw;
@@ -66,6 +69,41 @@ static float clampf(float x, float lo, float hi) {
 	if(x > hi)
 		return hi;
 	return x;
+}
+
+static int32_t spring_wrap(int32_t d) {
+	d %= COUNTS_PER_REV;
+	if(d < 0)
+		d += COUNTS_PER_REV;
+	if(d > COUNTS_PER_REV / 2)
+		d -= COUNTS_PER_REV;
+	return d;
+}
+
+static float spring_uq(int32_t d_counts, float vel, float k) {
+	float err = (float)spring_wrap(d_counts) * RAD_PER_COUNT;
+	return clampf(k * err - SPRING_D * vel, -SPRING_UQ_MAX, SPRING_UQ_MAX);
+}
+
+static bool spring_selfcheck(void) {
+	if(spring_wrap(100) != 100)
+		return false;
+	if(spring_wrap(-100) != -100)
+		return false;
+	if(spring_wrap(COUNTS_PER_REV - 100) != -100)
+		return false;
+	if(spring_uq(2000, 0.f, SPRING_K) <= 0.f)
+		return false;
+	if(spring_uq(-2000, 0.f, SPRING_K) >= 0.f)
+		return false;
+	// 1 count through the LPF must not eat ~10° of restoring Uq
+	float v = SPRING_VEL_ALPHA * RAD_PER_COUNT * (float)PWM_HZ;
+	float u10 = SPRING_K * (10.f * 3.14159265f / 180.f);
+	if(SPRING_D * v >= u10 * 0.5f)
+		return false;
+	if(SPRING_UQ_MAX <= DIR_PULSE_UQ)
+		return false;
+	return true;
 }
 
 static uint16_t duty_to_level(float d) {
@@ -367,17 +405,11 @@ static void motor_isr(void) {
 			}
 			break;
 		case MOTOR_SPRING: {
-			int32_t d = rest_pos - pos;
-			d %= COUNTS_PER_REV;
-			if(d < 0)
-				d += COUNTS_PER_REV;
-			if(d > COUNTS_PER_REV / 2)
-				d -= COUNTS_PER_REV;
-			float err = (float)d * RAD_PER_COUNT;
-			float vel = (float)(pos - pos_last) * RAD_PER_COUNT * (float)PWM_HZ;
+			float vel_raw = (float)(pos - pos_last) * RAD_PER_COUNT * (float)PWM_HZ;
 			pos_last = pos;
+			vel_filt += SPRING_VEL_ALPHA * (vel_raw - vel_filt);
 			ud_cmd = 0.f;
-			uq_cmd = clampf(spring_k * err - SPRING_D * vel, -SPRING_UQ_MAX, SPRING_UQ_MAX);
+			uq_cmd = spring_uq(rest_pos - pos, vel_filt, spring_k);
 			te_from_encoder = true;
 			break;
 		}
@@ -425,6 +457,7 @@ bool motor_cmd_spring(void) {
 	irq_set_enabled(PWM_IRQ_WRAP, false);
 	rest_pos = pos;
 	pos_last = pos;
+	vel_filt = 0.f;
 	enter_mode(MOTOR_SPRING);
 	irq_set_enabled(PWM_IRQ_WRAP, true);
 	return true;
@@ -445,6 +478,8 @@ void motor_setup(void) {
 	// ponytail: 1024-pt sin LUT (~4KB); cos = lut[i+N/4]. Ceiling: ~0.35°; upgrade = lerp.
 	for(uint32_t i = 0; i < SIN_LUT_N; i++)
 		sin_lut[i] = sinf((float)i * (TWO_PI / (float)SIN_LUT_N));
+	if(!spring_selfcheck())
+		LOG_RAW("spring selfcheck FAIL\n");
 
 	gpio_init(PIN_DRV_EN);
 	gpio_set_dir(PIN_DRV_EN, GPIO_OUT);

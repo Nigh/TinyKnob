@@ -49,7 +49,7 @@ make rebuild
 
 ## Usage
 
-On power-up the firmware stays idle with INHx held low (no PWM switching; low quiescent power). CDC `START` + newline runs align, then waits. Switch feel with `SPRING` / `TEST` / `STOP`. Continuous SSI CRC failures trip FAULT and return to the same low-side brake idle. True phase Hi-Z needs INLx wired later.
+On power-up the firmware stays idle with INHx held low (no PWM switching; low quiescent power). CDC `START` + newline runs align, then waits. Switch feel with `SPRING` / `SPIN` / `TEST` / `STOP`. Continuous SSI CRC failures trip FAULT and return to the same low-side brake idle. True phase Hi-Z needs INLx wired later.
 
 USB enumerates CDC (logs) and HID. HID report byte 0:
 
@@ -62,6 +62,9 @@ CDC commands (line ending `\n` or `\r`):
 
 - `START` align, then idle (armed)
 - `SPRING` virtual spring at current angle (needs START)
+- `SPIN` voltage-mode flywheel (needs START). Under-compensates BEMF so it will not
+  self-spin; feel is draggy until an `Iq` current loop can hold `Iq≈0` (needs CSA/CSB/CSC).
+  `Uq=0` is low-side brake (no INLx Hi-Z yet).
 - `TEST` loop ±360° with 5th-order ease (~1.4s move + ≤200ms hold) (needs START)
 - `STOP` brake / idle, keep align
 - `DUMP` print one full SSI frame (bits + shift candidates), waits on CDC so lines are complete

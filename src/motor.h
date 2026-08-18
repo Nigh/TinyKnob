@@ -12,6 +12,7 @@ enum {
 	MOTOR_ALIGN_DOWN,
 	MOTOR_TEST,
 	MOTOR_SPRING,
+	MOTOR_SPIN, // voltage-mode only; true freewheel needs Iq current loop
 	MOTOR_FAULT,
 };
 
@@ -31,6 +32,7 @@ void motor_setup(void);
 void motor_start(void);
 void motor_cmd_stop(void);
 bool motor_cmd_spring(void);
+bool motor_cmd_spin(void); // provisional flywheel; needs Iq loop for low-drag coast
 bool motor_cmd_test(void);
 void motor_set_duty(float a, float b, float c);
 void motor_get_state(motor_state_t* s);

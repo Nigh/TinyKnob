@@ -16,6 +16,7 @@
 #define SIN_LUT_MASK (SIN_LUT_N - 1)
 #define PWM_MIN_MAG2 (PWM_MIN_MAG * PWM_MIN_MAG)
 #define SPRING_VEL_ALPHA (TWO_PI * SPRING_VEL_LP_HZ / (float)PWM_HZ)
+#define SPIN_VEL_ALPHA (TWO_PI * SPIN_VEL_LP_HZ / (float)PWM_HZ)
 
 static float sin_lut[SIN_LUT_N];
 
@@ -106,6 +107,47 @@ static bool spring_selfcheck(void) {
 	return true;
 }
 
+static float vel_update(float alpha) {
+	float vel_raw = (float)(pos - pos_last) * RAD_PER_COUNT * (float)PWM_HZ;
+	pos_last = pos;
+	vel_filt += alpha * (vel_raw - vel_filt);
+	return vel_filt;
+}
+
+static float spin_uq(float vel) {
+	float absv = vel < 0.f ? -vel : vel;
+	if(absv < SPIN_W_REST)
+		return 0.f;
+	float signv = vel < 0.f ? -1.f : 1.f;
+	float over = absv - SPIN_W_MAX;
+	if(over < 0.f)
+		over = 0.f;
+	float u = (SPIN_KV - SPIN_B) * vel - SPIN_B_CAP * over * signv;
+	return clampf(u, -SPIN_UQ_MAX, SPIN_UQ_MAX);
+}
+
+static bool spin_selfcheck(void) {
+	if(spin_uq(0.f) != 0.f)
+		return false;
+	if(spin_uq(SPIN_W_REST * 0.5f) != 0.f)
+		return false;
+	if(SPIN_B <= 0.f || SPIN_B >= SPIN_KV)
+		return false;
+	float net = SPIN_KV - SPIN_B;
+	if(net >= 0.025f)
+		return false;
+	if(spin_uq(2.f) <= 0.f || spin_uq(-2.f) >= 0.f)
+		return false;
+	float u2 = spin_uq(2.f);
+	if(u2 < net * 2.f - 0.002f || u2 > net * 2.f + 0.002f)
+		return false;
+	if(spin_uq(SPIN_W_MAX * 0.5f) <= 0.f)
+		return false;
+	if(SPIN_W_MAX <= SPIN_W_REST)
+		return false;
+	return true;
+}
+
 static uint16_t duty_to_level(float d) {
 	if(d < 0.f)
 		d = 0.f;
@@ -186,7 +228,13 @@ static void sincos_lut(float te, float* s_out, float* c_out) {
 
 static void apply_voltage(float ud, float uq, float te) {
 	float mag2 = ud * ud + uq * uq;
-	if(mag2 < PWM_MIN_MAG2) {
+	// ponytail: 0% duty is LS brake. SPIN needs tiny PWM to follow BEMF; spring keeps the deadzone.
+	if(mode == MOTOR_SPIN) {
+		if(mag2 < 1.0e-12f) {
+			motor_set_duty(0.f, 0.f, 0.f);
+			return;
+		}
+	} else if(mag2 < PWM_MIN_MAG2) {
 		motor_set_duty(0.f, 0.f, 0.f);
 		return;
 	}
@@ -405,11 +453,15 @@ static void motor_isr(void) {
 			}
 			break;
 		case MOTOR_SPRING: {
-			float vel_raw = (float)(pos - pos_last) * RAD_PER_COUNT * (float)PWM_HZ;
-			pos_last = pos;
-			vel_filt += SPRING_VEL_ALPHA * (vel_raw - vel_filt);
+			float vel = vel_update(SPRING_VEL_ALPHA);
 			ud_cmd = 0.f;
-			uq_cmd = spring_uq(rest_pos - pos, vel_filt, spring_k);
+			uq_cmd = spring_uq(rest_pos - pos, vel, spring_k);
+			te_from_encoder = true;
+			break;
+		}
+		case MOTOR_SPIN: {
+			ud_cmd = 0.f;
+			uq_cmd = spin_uq(vel_update(SPIN_VEL_ALPHA));
 			te_from_encoder = true;
 			break;
 		}
@@ -463,6 +515,17 @@ bool motor_cmd_spring(void) {
 	return true;
 }
 
+bool motor_cmd_spin(void) {
+	if(!aligned || mode == MOTOR_FAULT || is_aligning())
+		return false;
+	irq_set_enabled(PWM_IRQ_WRAP, false);
+	pos_last = pos;
+	vel_filt = 0.f;
+	enter_mode(MOTOR_SPIN);
+	irq_set_enabled(PWM_IRQ_WRAP, true);
+	return true;
+}
+
 bool motor_cmd_test(void) {
 	if(!aligned || mode == MOTOR_FAULT || is_aligning())
 		return false;
@@ -480,6 +543,8 @@ void motor_setup(void) {
 		sin_lut[i] = sinf((float)i * (TWO_PI / (float)SIN_LUT_N));
 	if(!spring_selfcheck())
 		LOG_RAW("spring selfcheck FAIL\n");
+	if(!spin_selfcheck())
+		LOG_RAW("spin selfcheck FAIL\n");
 
 	gpio_init(PIN_DRV_EN);
 	gpio_set_dir(PIN_DRV_EN, GPIO_OUT);

@@ -29,7 +29,8 @@ static __inline void CRITICAL_REGION_EXIT(void) {
 }
 
 bool timer_4hz_callback(struct repeating_timer* t) {
-	LOG_RAW("At %lld us:\n", time_us_64());
+	(void)t;
+	// IRQ: only queue the event — never touch TinyUSB / LOG_RAW here.
 	uevt_bc_e(UEVT_TIMER_4HZ);
 	return true;
 }
@@ -140,55 +141,63 @@ void hid_receive(uint8_t const* buffer, uint16_t bufsize) {
 	}
 }
 
-static char serial_fifo[16];
-static uint8_t serial_wp = 0;
-uint8_t serial_got(const char* str) {
-	uint8_t len = strlen(str);
-	for(uint8_t i = 1; i <= len; i++) {
-		if(serial_fifo[(serial_wp + (0x10 - i)) & 0xF] != str[len - i]) {
-			return 0;
-		}
+static char serial_line[40];
+static uint8_t serial_line_len;
+
+static void serial_handle_line(const char* line) {
+	if(strcmp(line, "UPLOAD") == 0) {
+		ws2812_setpixel(U32RGB(20, 0, 20));
+		reset_usb_boot(0, 0);
+		return;
 	}
-	return 1;
+	if(strcmp(line, "START") == 0) {
+		LOG_RAW("START: align\n");
+		motor_start();
+		return;
+	}
+	if(strcmp(line, "SPRING") == 0) {
+		if(motor_cmd_spring()) {
+			LOG_RAW("SPRING\n");
+		} else {
+			LOG_RAW("need START\n");
+		}
+		return;
+	}
+	if(strcmp(line, "TEST") == 0) {
+		if(motor_cmd_test()) {
+			LOG_RAW("TEST\n");
+		} else {
+			LOG_RAW("need START\n");
+		}
+		return;
+	}
+	if(strcmp(line, "STOP") == 0) {
+		LOG_RAW("STOP\n");
+		motor_cmd_stop();
+		return;
+	}
+	if(strcmp(line, "DUMP") == 0) {
+		motor_state_t st;
+		motor_get_state(&st);
+		mt6701_log_dump(st.pio_word);
+	}
 }
+
 void serial_receive(uint8_t const* buffer, uint16_t bufsize) {
 	for(uint16_t i = 0; i < bufsize; i++) {
 		uint8_t c = buffer[i];
-		if((c == 0x0A) || (c == 0x0D)) {
-			if(serial_got("UPLOAD")) {
-				ws2812_setpixel(U32RGB(20, 0, 20));
-				reset_usb_boot(0, 0);
+		if(c == '\n' || c == '\r') {
+			if(serial_line_len > 0) {
+				serial_line[serial_line_len] = 0;
+				serial_handle_line(serial_line);
+				serial_line_len = 0;
 			}
-			if(serial_got("START")) {
-				LOG_RAW("START: align\n");
-				motor_start();
-			}
-			if(serial_got("SPRING")) {
-				if(motor_cmd_spring()) {
-					LOG_RAW("SPRING\n");
-				} else {
-					LOG_RAW("need START\n");
-				}
-			}
-			if(serial_got("TEST")) {
-				if(motor_cmd_test()) {
-					LOG_RAW("TEST\n");
-				} else {
-					LOG_RAW("need START\n");
-				}
-			}
-			if(serial_got("STOP")) {
-				LOG_RAW("STOP\n");
-				motor_cmd_stop();
-			}
-			if(serial_got("DUMP")) {
-				motor_state_t st;
-				motor_get_state(&st);
-				mt6701_log_dump(st.pio_word);
-			}
-		} else {
-			serial_fifo[serial_wp++ & 0xF] = (char)c;
+			continue;
 		}
+		if(serial_line_len + 1u < sizeof(serial_line))
+			serial_line[serial_line_len++] = (char)c;
+		else
+			serial_line_len = 0; // overrun: drop line
 	}
 }
 

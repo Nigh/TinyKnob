@@ -1,29 +1,21 @@
-
 #ifndef _PLATFORM_H_
 #define _PLATFORM_H_
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
 #include "tusb.h"
 #include "usb_func.h"
 #include "scheduler/uevent.h"
 
 #if G_LOG_ENABLED == 1
 extern char log_cache[128];
-extern char log_buffer[512];
-extern uint16_t log_ptr;
-extern int16_t log_length;
 	#define LOG_RAW(...) \
 		do { \
-			log_length = sprintf(log_cache, __VA_ARGS__) + 1; \
-			if(log_length > 1) { \
-				if(log_ptr + log_length >= 512) { \
-					log_ptr = 0; \
-				} \
-				memcpy(log_buffer + log_ptr, log_cache, log_length); \
-				cdc_log_print(log_buffer + log_ptr); \
-				log_ptr += log_length; \
-			} \
-		} while(0);
+			int _n = snprintf(log_cache, sizeof(log_cache), __VA_ARGS__); \
+			if(_n > 0) \
+				cdc_log_enqueue(log_cache, (uint16_t)_n); \
+		} while(0)
 #else
 	#define LOG_RAW(...)
 #endif

@@ -1,5 +1,8 @@
 ;
-; MT6701 SSI: 24-bit frame, CLK idle high, sample DO on falling edge.
+; MT6701 SSI: 24-bit, CLK idle high.
+; Data updates on rising, sample on falling.
+; First falling after CSN is dummy (no sample).
+; Last bit: no falling edge; wait one CLK period then sample while high.
 ; SET = CSN, SIDESET = CLK, IN = DO
 ;
 
@@ -8,12 +11,18 @@
 
 .wrap_target
     pull block          side 1
-    set pins, 0         side 1 [7]
-    set x, 23           side 1
+    set pins, 0         side 1 [15] ; CSN low, CLK high (>=100ns)
+    nop                 side 1 [15]
+    nop                 side 0 [7]  ; first falling: no sample
+    set x, 22           side 0      ; 23 bits sampled on falling
 bitloop:
-    in pins, 1          side 0
-    jmp x-- bitloop     side 1
-    set pins, 1         side 1 [7]
+    nop                 side 1 [7]  ; rising — DO updates
+    in pins, 1          side 0 [7]  ; falling — sample
+    jmp x-- bitloop     side 0
+    nop                 side 1 [7]  ; last rising — CRC LSB
+    nop                 side 1 [7]  ; wait one CLK, stay high
+    in pins, 1          side 1 [7]  ; sample last bit, CLK high
+    set pins, 1         side 1 [15] ; CSN high, CLK idle high
 .wrap
 
 % c-sdk {
@@ -24,6 +33,7 @@ static inline void mt6701_ssi_program_init(PIO pio, uint sm, uint offset, uint p
     pio_gpio_init(pio, pin_csn);
     pio_gpio_init(pio, pin_clk);
     pio_gpio_init(pio, pin_do);
+    gpio_disable_pulls(pin_do);
     gpio_pull_up(pin_do);
 
     pio_sm_set_consecutive_pindirs(pio, sm, pin_csn, 1, true);
@@ -35,6 +45,7 @@ static inline void mt6701_ssi_program_init(PIO pio, uint sm, uint offset, uint p
     sm_config_set_sideset_pins(&c, pin_clk);
     sm_config_set_in_pins(&c, pin_do);
     sm_config_set_in_shift(&c, false, true, 24);
+    // PIO ~2 MHz; half-bit 8 cycles → CLK ~125 kHz (period >> 64ns)
     sm_config_set_clkdiv(&c, (float)clock_get_hz(clk_sys) / 2000000.0f);
 
     pio_sm_set_pins_with_mask(pio, sm, (1u << pin_csn) | (1u << pin_clk), (1u << pin_csn) | (1u << pin_clk));

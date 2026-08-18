@@ -2,16 +2,16 @@
 #define _MOTOR_H_
 
 #include <stdint.h>
+#include <stdbool.h>
 
 enum {
-	MOTOR_ALIGN_RAMP = 0,
+	MOTOR_IDLE = 0,
+	MOTOR_ALIGN_RAMP,
 	MOTOR_ALIGN_HOLD,
 	MOTOR_DIR_PULSE,
 	MOTOR_ALIGN_DOWN,
-	MOTOR_MOVE_FWD,
-	MOTOR_MOVE_REV,
+	MOTOR_TEST,
 	MOTOR_SPRING,
-	MOTOR_IDLE,
 	MOTOR_FAULT,
 };
 
@@ -21,9 +21,17 @@ typedef struct {
 	int32_t offset_mrad;
 	int8_t dir;
 	uint32_t crc_fail;
+	uint32_t crc_ok;
+	uint32_t raw;
+	uint32_t pio_word;
+	bool last_crc_ok;
 } motor_state_t;
 
 void motor_setup(void);
+void motor_start(void);
+void motor_cmd_stop(void);
+bool motor_cmd_spring(void);
+bool motor_cmd_test(void);
 void motor_set_duty(float a, float b, float c);
 void motor_get_state(motor_state_t* s);
 void motor_set_spring_k(float k);

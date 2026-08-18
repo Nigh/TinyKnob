@@ -6,6 +6,7 @@
 #define PIN_PWM_A 2
 #define PIN_PWM_B 4
 #define PIN_PWM_C 6
+#define PIN_DRV_EN 8
 
 #define PIN_MT6701_CSN 9
 #define PIN_MT6701_CLK 10
@@ -14,16 +15,26 @@
 #define MOTOR_POLE_PAIRS 11
 
 #define PWM_HZ 20000u
-#define ALIGN_UD 0.12f
-#define ALIGN_RAMP_MS 50u
-#define ALIGN_HOLD_MS 300u
-#define DIR_PULSE_MS 20u
-#define DIR_PULSE_UQ 0.08f
-#define UQ_MAX 0.20f
-#define MOVE_REV_MS 2000u
-#define POS_KP 1.5f
-#define SPRING_K 0.8f
-#define SPRING_D 0.02f
+#define ALIGN_UD 0.75f
+#define ALIGN_RAMP_MS 200u
+#define ALIGN_DRAG_MS 2500u
+#define ALIGN_DRAG_ELEC_REVS 2.f
+#define ALIGN_DRAG_MIN_COUNTS 400
+#define ALIGN_HOLD_MS 500u
+#define DIR_PULSE_MS 600u
+#define DIR_PULSE_UQ 0.18f
+#define DIR_PULSE_COUNTS 80
+#define PWM_MIN_MAG 0.012f
+#define POS_KP 0.6f
+#define TEST_MOVE_MS 1400u
+#define TEST_HOLD_MS 200u
+#define TEST_UQ_MAX 0.65f
+// ponytail: open-loop Kv (V/(rad/s)); retune if TEST lags (Uq_ff ≈ lag_rad * POS_KP).
+#define TEST_KV 0.07f
+#define SPRING_K 0.04f
+#define SPRING_D 0.012f
+#define SPRING_UQ_MAX 0.05f
+#define CRC_FAIL_TRIP 200u
 
 // ponytail: CSA/CSB/CSC not wired; ADC current loop later. Do not assign GPIOs until the analog traces exist.
 // #define PIN_CSA

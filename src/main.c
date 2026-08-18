@@ -38,15 +38,19 @@ bool timer_4hz_callback(struct repeating_timer* t) {
 
 void led_blink_routine(void) {
 	static uint8_t _tick = 0;
+	motor_state_t st;
+	motor_get_state(&st);
 	_tick += 1;
-	if(_tick & 0x1) {
-		if(usb_mounted) {
-			ws2812_setpixel(U32RGB(4, 14, 4));
-		} else {
-			ws2812_setpixel(U32RGB(20, 20, 2));
-		}
-	} else {
+	if((_tick & 0x1) == 0) {
 		ws2812_setpixel(U32RGB(0, 0, 0));
+		return;
+	}
+	if(st.mode == MOTOR_FAULT) {
+		ws2812_setpixel(U32RGB(32, 0, 0));
+	} else if(usb_mounted) {
+		ws2812_setpixel(U32RGB(4, 14, 4));
+	} else {
+		ws2812_setpixel(U32RGB(20, 20, 2));
 	}
 }
 
@@ -55,10 +59,20 @@ void main_handler(uevt_t* evt) {
 		case UEVT_TIMER_4HZ:
 			led_blink_routine();
 			{
+				static uint8_t tick;
 				motor_state_t st;
 				motor_get_state(&st);
-				LOG_RAW("m %u pos %ld dir %d off %ld crc_fail %lu\n",
-						st.mode, (long)st.pos, st.dir, (long)st.offset_mrad, (unsigned long)st.crc_fail);
+				tick++;
+				// 4 Hz during align and TEST; else ~1 Hz
+				bool fast = (st.mode >= MOTOR_ALIGN_RAMP && st.mode <= MOTOR_ALIGN_DOWN) ||
+						st.mode == MOTOR_TEST;
+				if(fast || (tick & 3) == 0) {
+					LOG_RAW("m%u p%ld o%lu f%lu d%d\n",
+							st.mode, (long)st.pos,
+							(unsigned long)st.crc_ok, (unsigned long)st.crc_fail,
+							st.dir);
+					mt6701_log_brief(st.pio_word);
+				}
 			}
 			break;
 	}
@@ -131,7 +145,7 @@ static uint8_t serial_wp = 0;
 uint8_t serial_got(const char* str) {
 	uint8_t len = strlen(str);
 	for(uint8_t i = 1; i <= len; i++) {
-		if(serial_fifo[serial_wp + (0x10 - i) & 0xF] != str[len - i]) {
+		if(serial_fifo[(serial_wp + (0x10 - i)) & 0xF] != str[len - i]) {
 			return 0;
 		}
 	}
@@ -139,13 +153,41 @@ uint8_t serial_got(const char* str) {
 }
 void serial_receive(uint8_t const* buffer, uint16_t bufsize) {
 	for(uint16_t i = 0; i < bufsize; i++) {
-		if((*buffer == 0x0A) || (*buffer == 0x0D)) {
+		uint8_t c = buffer[i];
+		if((c == 0x0A) || (c == 0x0D)) {
 			if(serial_got("UPLOAD")) {
 				ws2812_setpixel(U32RGB(20, 0, 20));
 				reset_usb_boot(0, 0);
 			}
+			if(serial_got("START")) {
+				LOG_RAW("START: align\n");
+				motor_start();
+			}
+			if(serial_got("SPRING")) {
+				if(motor_cmd_spring()) {
+					LOG_RAW("SPRING\n");
+				} else {
+					LOG_RAW("need START\n");
+				}
+			}
+			if(serial_got("TEST")) {
+				if(motor_cmd_test()) {
+					LOG_RAW("TEST\n");
+				} else {
+					LOG_RAW("need START\n");
+				}
+			}
+			if(serial_got("STOP")) {
+				LOG_RAW("STOP\n");
+				motor_cmd_stop();
+			}
+			if(serial_got("DUMP")) {
+				motor_state_t st;
+				motor_get_state(&st);
+				mt6701_log_dump(st.pio_word);
+			}
 		} else {
-			serial_fifo[serial_wp++ & 0xF] = *buffer++;
+			serial_fifo[serial_wp++ & 0xF] = (char)c;
 		}
 	}
 }
@@ -167,6 +209,7 @@ int main() {
 	add_repeating_timer_us(249978ul, timer_4hz_callback, NULL, &timer);
 	tusb_init();
 	cdc_log_init();
+	LOG_RAW("idle: START SPRING TEST STOP DUMP + newline\n");
 	while(true) {
 		app_sched_execute();
 		tud_task();

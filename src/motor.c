@@ -8,20 +8,35 @@
 #include <math.h>
 
 #define RAD_PER_COUNT (2.f * 3.14159265f / 16384.f)
+#define TWO_PI 6.2831853f
 #define SQRT3_2 0.86602540378f
 #define COUNTS_PER_REV 16384
+#define SIN_LUT_N 1024
+#define SIN_LUT_MASK (SIN_LUT_N - 1)
+#define PWM_MIN_MAG2 (PWM_MIN_MAG * PWM_MIN_MAG)
+
+static float sin_lut[SIN_LUT_N];
 
 static uint pwm_wrap;
 static uint pwm_slice_a;
+static uint pwm_slice_b;
+static uint pwm_slice_c;
+static uint32_t pwm_enable_mask;
 
-static volatile uint8_t mode;
+static volatile uint8_t mode = MOTOR_IDLE;
+static volatile bool aligned;
 static volatile int32_t pos;
 static volatile int8_t dir = 1;
 static volatile uint32_t crc_fail;
+static volatile uint32_t crc_ok;
+static volatile uint32_t last_raw;
+static volatile uint32_t last_pio;
+static volatile bool last_crc_ok;
 static float offset_rad;
 static float align_theta_m;
 static int32_t pulse_pos0;
 static int32_t home_pos;
+static bool test_fwd;
 static int32_t move_start;
 static int32_t move_target;
 static int32_t rest_pos;
@@ -31,11 +46,15 @@ static int32_t pos_last;
 static bool have_enc;
 static uint16_t prev_raw;
 static uint32_t mode_tick;
-static uint32_t hold_sum;
+static int64_t hold_sum;
 static uint32_t hold_n;
+static int32_t drag_pos0;
+static uint32_t crc_fail_run;
 static float ud_cmd;
 static float uq_cmd;
+static float forced_te;
 static bool te_from_encoder;
+static bool enc_ok_this;
 
 static uint32_t ms_to_ticks(uint32_t ms) {
 	return (PWM_HZ * ms) / 1000u;
@@ -63,12 +82,25 @@ void motor_set_duty(float a, float b, float c) {
 	pwm_set_gpio_level(PIN_PWM_C, duty_to_level(c));
 }
 
+// ponytail: no INLx — cannot Hi-Z. IDLE holds INHx low (LS on). Mid PWM switches hard and wastes watts.
+static void motor_brake_low(void) {
+	ud_cmd = 0.f;
+	uq_cmd = 0.f;
+	forced_te = 0.f;
+	te_from_encoder = false;
+	motor_set_duty(0.f, 0.f, 0.f);
+}
+
 void motor_get_state(motor_state_t* s) {
 	s->mode = mode;
 	s->pos = pos;
 	s->offset_mrad = (int32_t)(offset_rad * 1000.f);
 	s->dir = dir;
 	s->crc_fail = crc_fail;
+	s->crc_ok = crc_ok;
+	s->raw = last_raw;
+	s->pio_word = last_pio;
+	s->last_crc_ok = last_crc_ok;
 }
 
 void motor_set_spring_k(float k) {
@@ -103,14 +135,30 @@ static void ingest_encoder(uint16_t raw) {
 	prev_raw = raw;
 }
 
+static void sincos_lut(float te, float* s_out, float* c_out) {
+	// Map te → [0,1) cycles without fmodf (soft-float heavy).
+	float turns = te * (1.f / TWO_PI);
+	turns -= (float)(int32_t)turns;
+	if(turns < 0.f)
+		turns += 1.f;
+	uint32_t i = (uint32_t)(turns * (float)SIN_LUT_N) & SIN_LUT_MASK;
+	*s_out = sin_lut[i];
+	*c_out = sin_lut[(i + (SIN_LUT_N / 4)) & SIN_LUT_MASK];
+}
+
 static void apply_voltage(float ud, float uq, float te) {
-	float mag = sqrtf(ud * ud + uq * uq);
-	if(mag > 1.f) {
-		ud /= mag;
-		uq /= mag;
+	float mag2 = ud * ud + uq * uq;
+	if(mag2 < PWM_MIN_MAG2) {
+		motor_set_duty(0.f, 0.f, 0.f);
+		return;
 	}
-	float c = cosf(te);
-	float s = sinf(te);
+	if(mag2 > 1.f) {
+		float inv = 1.f / sqrtf(mag2);
+		ud *= inv;
+		uq *= inv;
+	}
+	float s, c;
+	sincos_lut(te, &s, &c);
 	float ualpha = ud * c - uq * s;
 	float ubeta = ud * s + uq * c;
 	float va = ualpha;
@@ -120,7 +168,7 @@ static void apply_voltage(float ud, float uq, float te) {
 }
 
 static void apply_cmd(void) {
-	float te = 0.f;
+	float te = forced_te;
 	if(te_from_encoder) {
 		float th_m = (float)pos * RAD_PER_COUNT;
 		te = (float)dir * th_m * (float)MOTOR_POLE_PAIRS + offset_rad;
@@ -140,30 +188,78 @@ static void start_move(int32_t target, uint8_t next) {
 	enter_mode(next);
 }
 
+static bool is_aligning(void) {
+	return mode >= MOTOR_ALIGN_RAMP && mode <= MOTOR_ALIGN_DOWN;
+}
+
 static bool follow_move(void) {
-	uint32_t dur = ms_to_ticks(MOVE_REV_MS);
-	if(dur == 0)
-		dur = 1;
-	float t = (float)mode_tick / (float)dur;
-	if(t > 1.f)
-		t = 1.f;
-	int32_t target = move_start + (int32_t)((float)(move_target - move_start) * t);
+	uint32_t move = ms_to_ticks(TEST_MOVE_MS);
+	uint32_t hold = ms_to_ticks(TEST_HOLD_MS);
+	if(move == 0)
+		move = 1;
+	float t = (mode_tick < move) ? ((float)mode_tick / (float)move) : 1.f;
+	// 5th-order smoothstep: s=10t³−15t⁴+6t⁵, ds/dt=30t²(1−t)²
+	float s;
+	float dsdt;
+	if(t <= 0.f) {
+		s = 0.f;
+		dsdt = 0.f;
+	} else if(t >= 1.f) {
+		s = 1.f;
+		dsdt = 0.f;
+	} else {
+		float t2 = t * t;
+		float t3 = t2 * t;
+		float t4 = t3 * t;
+		float t5 = t4 * t;
+		float u = 1.f - t;
+		s = 10.f * t3 - 15.f * t4 + 6.f * t5;
+		dsdt = 30.f * t2 * u * u;
+	}
+	int32_t span = move_target - move_start;
+	int32_t target = move_start + (int32_t)((float)span * s);
 	float err = (float)(target - pos) * RAD_PER_COUNT;
+	float omega = (float)span * RAD_PER_COUNT * dsdt * (float)PWM_HZ / (float)move;
 	ud_cmd = 0.f;
-	uq_cmd = clampf(err * POS_KP, -UQ_MAX, UQ_MAX);
+	uq_cmd = clampf(err * POS_KP + TEST_KV * omega, -TEST_UQ_MAX, TEST_UQ_MAX);
 	te_from_encoder = true;
-	return mode_tick >= dur;
+	return mode_tick >= move + hold;
+}
+
+static void trip_fault(void) {
+	aligned = false;
+	motor_brake_low();
+	enter_mode(MOTOR_FAULT);
 }
 
 static void motor_isr(void) {
+	enc_ok_this = false;
 	mt6701_sample_t s;
 	if(mt6701_try_read(&s)) {
-		if(s.crc_ok)
+		last_raw = s.raw;
+		last_pio = s.pio_word;
+		last_crc_ok = s.crc_ok;
+		if(s.crc_ok) {
 			ingest_encoder(s.angle);
-		else
+			crc_ok++;
+			crc_fail_run = 0;
+			enc_ok_this = true;
+		} else {
 			crc_fail++;
+			crc_fail_run++;
+			if(mode != MOTOR_IDLE && mode != MOTOR_FAULT && crc_fail_run >= CRC_FAIL_TRIP) {
+				trip_fault();
+				mt6701_start_read();
+				return;
+			}
+		}
 	}
 	mt6701_start_read();
+
+	if(mode == MOTOR_IDLE || mode == MOTOR_FAULT) {
+		// Keep INHx low; wrap IRQ still runs for SSI. No mid-PWM switching.
+		return;
+	}
 
 	mode_tick++;
 	switch(mode) {
@@ -173,6 +269,7 @@ static void motor_isr(void) {
 				ramp = 1;
 			ud_cmd = ALIGN_UD * (float)mode_tick / (float)ramp;
 			uq_cmd = 0.f;
+			forced_te = 0.f;
 			te_from_encoder = false;
 			if(mode_tick >= ramp) {
 				ud_cmd = ALIGN_UD;
@@ -182,21 +279,42 @@ static void motor_isr(void) {
 			}
 			break;
 		}
-		case MOTOR_ALIGN_HOLD:
+		case MOTOR_ALIGN_HOLD: {
+			// ponytail: static Ud loses to cogging; drag d-axis 2 elec revs then hold. Current-sense ident later.
+			uint32_t drag = ms_to_ticks(ALIGN_DRAG_MS);
+			uint32_t hold = ms_to_ticks(ALIGN_HOLD_MS);
+			if(drag == 0)
+				drag = 1;
 			ud_cmd = ALIGN_UD;
 			uq_cmd = 0.f;
 			te_from_encoder = false;
-			if(have_enc) {
-				hold_sum += (uint32_t)prev_raw;
-				hold_n++;
-			}
-			if(mode_tick >= ms_to_ticks(ALIGN_HOLD_MS)) {
-				if(hold_n == 0) {
-					ud_cmd = 0.f;
-					enter_mode(MOTOR_FAULT);
-					break;
+			if(mode_tick == 1)
+				drag_pos0 = pos;
+			if(mode_tick <= drag) {
+				forced_te = ALIGN_DRAG_ELEC_REVS * (2.f * 3.14159265f) *
+						(float)mode_tick / (float)drag;
+				if(mode_tick == drag) {
+					int32_t dp = pos - drag_pos0;
+					if(dp < 0)
+						dp = -dp;
+					if(dp < (int32_t)ALIGN_DRAG_MIN_COUNTS) {
+						trip_fault();
+						return;
+					}
 				}
-				float avg = (float)(hold_sum / hold_n);
+			} else {
+				forced_te = 0.f;
+				if(enc_ok_this) {
+					hold_sum += pos;
+					hold_n++;
+				}
+			}
+			if(mode_tick >= drag + hold) {
+				if(hold_n < 8) {
+					trip_fault();
+					return;
+				}
+				float avg = (float)hold_sum / (float)hold_n;
 				align_theta_m = avg * RAD_PER_COUNT;
 				dir = 1;
 				offset_rad = -(float)dir * align_theta_m * (float)MOTOR_POLE_PAIRS;
@@ -204,15 +322,21 @@ static void motor_isr(void) {
 				enter_mode(MOTOR_DIR_PULSE);
 			}
 			break;
+		}
 		case MOTOR_DIR_PULSE:
-			ud_cmd = ALIGN_UD;
+			ud_cmd = 0.f;
 			uq_cmd = DIR_PULSE_UQ;
+			forced_te = 0.f;
 			te_from_encoder = false;
 			if(mode_tick >= ms_to_ticks(DIR_PULSE_MS)) {
-				if(have_enc && (pos < pulse_pos0 - 20)) {
+				int32_t dp = pos - pulse_pos0;
+				if(dp < -(int32_t)DIR_PULSE_COUNTS)
 					dir = -1;
-					offset_rad = -(float)dir * align_theta_m * (float)MOTOR_POLE_PAIRS;
-				}
+				else if(dp > (int32_t)DIR_PULSE_COUNTS)
+					dir = 1;
+				else
+					dir = -1; // no motion: treat as reversed phase sequence
+				offset_rad = -(float)dir * align_theta_m * (float)MOTOR_POLE_PAIRS;
 				enter_mode(MOTOR_ALIGN_DOWN);
 			}
 			break;
@@ -225,22 +349,21 @@ static void motor_isr(void) {
 				k = 0.f;
 			ud_cmd = ALIGN_UD * k;
 			uq_cmd = 0.f;
-			te_from_encoder = true;
+			forced_te = 0.f;
+			te_from_encoder = false;
 			if(mode_tick >= ramp) {
 				home_pos = pos;
-				start_move(home_pos + COUNTS_PER_REV, MOTOR_MOVE_FWD);
+				rest_pos = pos;
+				aligned = true;
+				motor_brake_low();
+				enter_mode(MOTOR_IDLE);
 			}
 			break;
 		}
-		case MOTOR_MOVE_FWD:
-			if(follow_move())
-				start_move(home_pos, MOTOR_MOVE_REV);
-			break;
-		case MOTOR_MOVE_REV:
+		case MOTOR_TEST:
 			if(follow_move()) {
-				rest_pos = home_pos;
-				pos_last = pos;
-				enter_mode(MOTOR_SPRING);
+				test_fwd = !test_fwd;
+				start_move(test_fwd ? home_pos + COUNTS_PER_REV : home_pos, MOTOR_TEST);
 			}
 			break;
 		case MOTOR_SPRING: {
@@ -254,21 +377,10 @@ static void motor_isr(void) {
 			float vel = (float)(pos - pos_last) * RAD_PER_COUNT * (float)PWM_HZ;
 			pos_last = pos;
 			ud_cmd = 0.f;
-			uq_cmd = clampf(spring_k * err - SPRING_D * vel, -UQ_MAX, UQ_MAX);
+			uq_cmd = clampf(spring_k * err - SPRING_D * vel, -SPRING_UQ_MAX, SPRING_UQ_MAX);
 			te_from_encoder = true;
 			break;
 		}
-		case MOTOR_IDLE:
-			ud_cmd = 0.f;
-			uq_cmd = 0.f;
-			te_from_encoder = true;
-			break;
-		case MOTOR_FAULT:
-			ud_cmd = 0.f;
-			uq_cmd = 0.f;
-			te_from_encoder = false;
-			motor_set_duty(0.5f, 0.5f, 0.5f);
-			return;
 		default:
 			break;
 	}
@@ -282,14 +394,70 @@ static void pwm_wrap_isr(void) {
 	}
 }
 
+void motor_start(void) {
+	if(is_aligning())
+		return;
+	aligned = false;
+	crc_fail_run = 0;
+	have_enc = false;
+	te_from_encoder = false;
+	forced_te = 0.f;
+	ud_cmd = 0.f;
+	uq_cmd = 0.f;
+	// Ensure PWM counters are running before first FOC update
+	pwm_set_mask_enabled(pwm_enable_mask);
+	enter_mode(MOTOR_ALIGN_RAMP);
+}
+
+void motor_cmd_stop(void) {
+	if(is_aligning()) {
+		aligned = false;
+	}
+	irq_set_enabled(PWM_IRQ_WRAP, false);
+	motor_brake_low();
+	enter_mode(MOTOR_IDLE);
+	irq_set_enabled(PWM_IRQ_WRAP, true);
+}
+
+bool motor_cmd_spring(void) {
+	if(!aligned || mode == MOTOR_FAULT || is_aligning())
+		return false;
+	irq_set_enabled(PWM_IRQ_WRAP, false);
+	rest_pos = pos;
+	pos_last = pos;
+	enter_mode(MOTOR_SPRING);
+	irq_set_enabled(PWM_IRQ_WRAP, true);
+	return true;
+}
+
+bool motor_cmd_test(void) {
+	if(!aligned || mode == MOTOR_FAULT || is_aligning())
+		return false;
+	irq_set_enabled(PWM_IRQ_WRAP, false);
+	home_pos = pos;
+	test_fwd = true;
+	start_move(home_pos + COUNTS_PER_REV, MOTOR_TEST);
+	irq_set_enabled(PWM_IRQ_WRAP, true);
+	return true;
+}
+
 void motor_setup(void) {
+	// ponytail: 1024-pt sin LUT (~4KB); cos = lut[i+N/4]. Ceiling: ~0.35°; upgrade = lerp.
+	for(uint32_t i = 0; i < SIN_LUT_N; i++)
+		sin_lut[i] = sinf((float)i * (TWO_PI / (float)SIN_LUT_N));
+
+	gpio_init(PIN_DRV_EN);
+	gpio_set_dir(PIN_DRV_EN, GPIO_OUT);
+	gpio_put(PIN_DRV_EN, 1); // nSLEEP/EN, active high
+
 	gpio_set_function(PIN_PWM_A, GPIO_FUNC_PWM);
 	gpio_set_function(PIN_PWM_B, GPIO_FUNC_PWM);
 	gpio_set_function(PIN_PWM_C, GPIO_FUNC_PWM);
 
 	pwm_slice_a = pwm_gpio_to_slice_num(PIN_PWM_A);
-	uint sb = pwm_gpio_to_slice_num(PIN_PWM_B);
-	uint sc = pwm_gpio_to_slice_num(PIN_PWM_C);
+	pwm_slice_b = pwm_gpio_to_slice_num(PIN_PWM_B);
+	pwm_slice_c = pwm_gpio_to_slice_num(PIN_PWM_C);
+	pwm_enable_mask = (1u << pwm_slice_a) | (1u << pwm_slice_b) | (1u << pwm_slice_c);
 
 	uint32_t sys = clock_get_hz(clk_sys);
 	pwm_wrap = sys / PWM_HZ;
@@ -301,19 +469,19 @@ void motor_setup(void) {
 	pwm_config_set_clkdiv(&cfg, 1.f);
 	pwm_config_set_wrap(&cfg, (uint16_t)pwm_wrap);
 	pwm_init(pwm_slice_a, &cfg, false);
-	pwm_init(sb, &cfg, false);
-	pwm_init(sc, &cfg, false);
+	pwm_init(pwm_slice_b, &cfg, false);
+	pwm_init(pwm_slice_c, &cfg, false);
 
-	motor_set_duty(0.5f, 0.5f, 0.5f);
-	mode = MOTOR_ALIGN_RAMP;
+	motor_brake_low();
+	mode = MOTOR_IDLE;
 	mode_tick = 0;
-	te_from_encoder = false;
 
 	pwm_clear_irq(pwm_slice_a);
 	pwm_set_irq_enabled(pwm_slice_a, true);
 	irq_set_exclusive_handler(PWM_IRQ_WRAP, pwm_wrap_isr);
 	irq_set_enabled(PWM_IRQ_WRAP, true);
 
-	pwm_set_mask_enabled((1u << pwm_slice_a) | (1u << sb) | (1u << sc));
+	// Enable counters for SSI pacing; outputs stay low at 0% duty (no FET switching)
+	pwm_set_mask_enabled(pwm_enable_mask);
 	mt6701_start_read();
 }

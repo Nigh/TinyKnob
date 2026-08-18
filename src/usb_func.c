@@ -1,25 +1,77 @@
-
 #include "tusb.h"
 #include "tusb_config.h"
+#include "hardware/sync.h"
 
 #include "string.h"
 
 volatile bool usb_mounted = false;
+
+void serial_receive(uint8_t const* buffer, uint16_t bufsize);
+void hid_receive(uint8_t const* buffer, uint16_t bufsize);
+
 //--------------------------------------------------------------------+
-// CDC Funcs
+// CDC log ring — enqueue from any context; drain only from main loop
 //--------------------------------------------------------------------+
 
-__attribute__((weak)) void serial_receive(uint8_t const* buffer, uint16_t bufsize) {
+#define CDC_LOG_RING 1024u
+
+static uint8_t log_ring[CDC_LOG_RING];
+static volatile uint16_t log_w;
+static volatile uint16_t log_r;
+static volatile uint32_t log_drop;
+
+static uint16_t ring_used(void) {
+	return (uint16_t)((log_w - log_r) & (CDC_LOG_RING - 1));
 }
 
-static uint16_t log_depth_max = 0;
+static uint16_t ring_free(void) {
+	return (uint16_t)(CDC_LOG_RING - 1u - ring_used());
+}
+
 void cdc_log_init(void) {
-	log_depth_max = tud_cdc_n_write_available(0);
+	log_w = 0;
+	log_r = 0;
+	log_drop = 0;
 }
-void cdc_log_flush(void) {
-	if(tud_cdc_n_write_available(0) < log_depth_max) {
-		tud_cdc_n_write_flush(0);
+
+void cdc_log_enqueue(const void* data, uint16_t len) {
+	if(len == 0 || data == NULL)
+		return;
+	uint32_t irq = save_and_disable_interrupts();
+	if(ring_free() < len) {
+		log_drop++;
+		restore_interrupts(irq);
+		return;
 	}
+	const uint8_t* p = (const uint8_t*)data;
+	for(uint16_t i = 0; i < len; i++) {
+		log_ring[log_w] = p[i];
+		log_w = (uint16_t)((log_w + 1u) & (CDC_LOG_RING - 1));
+	}
+	restore_interrupts(irq);
+}
+
+static void cdc_log_drain(void) {
+	if(!usb_mounted || !tud_cdc_n_connected(0))
+		return;
+	while(log_r != log_w) {
+		uint32_t avail = tud_cdc_n_write_available(0);
+		if(avail == 0) {
+			tud_cdc_n_write_flush(0);
+			break;
+		}
+		uint16_t used = ring_used();
+		uint16_t chunk = used;
+		if(chunk > avail)
+			chunk = (uint16_t)avail;
+		uint16_t to_end = (uint16_t)(CDC_LOG_RING - log_r);
+		if(chunk > to_end)
+			chunk = to_end;
+		tud_cdc_n_write(0, &log_ring[log_r], chunk);
+		log_r = (uint16_t)((log_r + chunk) & (CDC_LOG_RING - 1));
+	}
+	if(tud_cdc_n_write_available(0) < CFG_TUD_CDC_TX_BUFSIZE)
+		tud_cdc_n_write_flush(0);
 }
 
 void cdc_task(void) {
@@ -31,41 +83,35 @@ void cdc_task(void) {
 			serial_receive(buf, count);
 		}
 	}
-	cdc_log_flush();
-}
-
-static void serial_write(uint8_t itf, uint8_t buf[], uint32_t count) {
-	if(!usb_mounted) {
-		return;
-	}
-	if(tud_cdc_n_write_available(itf) < count) {
-		tud_cdc_n_write_flush(itf);
-	}
-	tud_cdc_n_write(itf, buf, count);
+	cdc_log_drain();
 }
 
 void cdc_log_print(char* str) {
-	if(!usb_mounted) {
+	if(str == NULL)
 		return;
-	}
-	uint16_t len = strlen(str);
-	if(tud_cdc_n_write_available(0) < len) {
-		tud_cdc_n_write_flush(0);
-	}
-	tud_cdc_n_write_str(0, str);
+	cdc_log_enqueue(str, (uint16_t)strlen(str));
 }
 
 // Blocking write for rare dumps — waits until CDC has room so lines are not truncated.
 void cdc_log_print_wait(char* str) {
-	if(!usb_mounted) {
+	if(!usb_mounted || str == NULL)
 		return;
-	}
 	uint16_t len = (uint16_t)strlen(str);
-	while(tud_cdc_n_write_available(0) < len) {
+	uint16_t off = 0;
+	while(off < len) {
 		tud_task();
-		tud_cdc_n_write_flush(0);
+		cdc_log_drain();
+		uint32_t avail = tud_cdc_n_write_available(0);
+		if(avail == 0) {
+			tud_cdc_n_write_flush(0);
+			continue;
+		}
+		uint16_t n = (uint16_t)(len - off);
+		if(n > avail)
+			n = (uint16_t)avail;
+		tud_cdc_n_write(0, str + off, n);
+		off = (uint16_t)(off + n);
 	}
-	tud_cdc_n_write(0, str, len);
 	tud_cdc_n_write_flush(0);
 }
 
@@ -73,24 +119,18 @@ void cdc_log_print_wait(char* str) {
 // Device callbacks
 //--------------------------------------------------------------------+
 
-// Invoked when device is mounted
 void tud_mount_cb(void) {
 	usb_mounted = true;
 }
 
-// Invoked when device is unmounted
 void tud_umount_cb(void) {
 	usb_mounted = false;
 }
 
-// Invoked when usb bus is suspended
-// remote_wakeup_en : if host allow us  to perform remote wakeup
-// Within 7ms, device must draw an average of current less than 2.5 mA from bus
 void tud_suspend_cb(bool remote_wakeup_en) {
 	(void)remote_wakeup_en;
 }
 
-// Invoked when usb bus is resumed
 void tud_resume_cb(void) {
 	usb_mounted = tud_mounted() ? true : false;
 }
@@ -99,38 +139,34 @@ void tud_resume_cb(void) {
 // USB HID
 //--------------------------------------------------------------------+
 
-// Invoked when received GET_REPORT control request
-// Application must fill buffer report's content and return its length.
-// Return zero will cause the stack to STALL request
 uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t* buffer, uint16_t reqlen) {
-	// TODO not Implemented
 	(void)itf;
 	(void)report_id;
 	(void)report_type;
 	(void)buffer;
 	(void)reqlen;
-
 	return 0;
 }
 
-__attribute__((weak)) void hid_receive(uint8_t const* buffer, uint16_t bufsize) {
+__attribute__((weak)) void serial_receive(uint8_t const* buffer, uint16_t bufsize) {
+	(void)buffer;
+	(void)bufsize;
 }
+
+__attribute__((weak)) void hid_receive(uint8_t const* buffer, uint16_t bufsize) {
+	(void)buffer;
+	(void)bufsize;
+}
+
 void hid_send(uint8_t const* buffer, uint16_t bufsize) {
-	if(!usb_mounted) {
+	if(!usb_mounted)
 		return;
-	}
 	tud_hid_report(0, buffer, bufsize);
 }
 
-// Invoked when received SET_REPORT control request or
-// received data on OUT endpoint ( Report ID = 0, Type = 0 )
 void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t const* buffer, uint16_t bufsize) {
-	// This example doesn't use multiple report and report ID
 	(void)itf;
 	(void)report_id;
 	(void)report_type;
-
 	hid_receive(buffer, bufsize);
-	// echo back anything we received from host
-	// tud_hid_report(0, buffer, bufsize);
 }

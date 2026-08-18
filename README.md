@@ -67,4 +67,4 @@ CDC commands (line ending `\n` or `\r`):
 - `DUMP` print one full SSI frame (bits + shift candidates), waits on CDC so lines are complete
 - `UPLOAD` reboot to UF2 bootloader
 
-Periodic log (~1 Hz) is a short `m/p/o/f` line plus one `ssi` brief line.
+Periodic status (~1 Hz, or 4 Hz during align/TEST) is a short `m/p/o/f` line plus one `ssi` brief line. CDC TX uses a 1 KB ring drained in the main loop; the 4 Hz timer IRQ never writes USB.

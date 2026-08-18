@@ -12,6 +12,7 @@ RP2040-Zero          DRV8316
 GPIO2  ------------- PWM_A / INHA
 GPIO4  ------------- PWM_B / INHB
 GPIO6  ------------- PWM_C / INHC
+GPIO8  ------------- EN / nSLEEP (active high; not DRVOFF)
 GND    ------------- GND
 
 RP2040-Zero          MT6701
@@ -22,7 +23,7 @@ GPIO11 <------------ DO
 GND    ------------- GND
 ```
 
-DRV8316 is already in 3x PWM with nSLEEP held high in hardware. Motor is a 4015 gimbal, 11 pole pairs.
+Firmware holds GPIO8 high from boot. DRV8316 is 3x PWM. Motor is a 4015 gimbal, 11 pole pairs. GPIO3/5/7 are left free for INLx later.
 
 Current-sense (SOA/SOB/SOC) is reserved for a later ADC current loop.
 
@@ -37,19 +38,18 @@ docker pull xianii/pico-sdk:latest
 ### build
 
 ```shell
-# build
+# build (docker, files owned by your user)
 make
-# clang-format
+# remove root-owned build/ from earlier docker runs
+make docker_clean
+# or: make clean  (falls back to docker_clean if build/ is not writable)
 make format
-# clear build
-make clean
-# rebuild
 make rebuild
 ```
 
 ## Usage
 
-On power-up the firmware locks the rotor to the d-axis, then closed-loop FOC turns one mechanical revolution forward and one back, then holds a virtual spring.
+On power-up the firmware stays idle with INHx held low (no PWM switching; low quiescent power). CDC `START` + newline runs align, then waits. Switch feel with `SPRING` / `TEST` / `STOP`. Continuous SSI CRC failures trip FAULT and return to the same low-side brake idle. True phase Hi-Z needs INLx wired later.
 
 USB enumerates CDC (logs) and HID. HID report byte 0:
 
@@ -58,4 +58,13 @@ USB enumerates CDC (logs) and HID. HID report byte 0:
 - `0x21` set rest to current angle
 - anything else: echo with each byte incremented by 1 (ping)
 
-CDC `UPLOAD` + newline reboots to UF2 bootloader.
+CDC commands (line ending `\n` or `\r`):
+
+- `START` align, then idle (armed)
+- `SPRING` virtual spring at current angle (needs START)
+- `TEST` loop ±360° with 5th-order ease (~1.4s move + ≤200ms hold) (needs START)
+- `STOP` brake / idle, keep align
+- `DUMP` print one full SSI frame (bits + shift candidates), waits on CDC so lines are complete
+- `UPLOAD` reboot to UF2 bootloader
+
+Periodic log (~1 Hz) is a short `m/p/o/f` line plus one `ssi` brief line.

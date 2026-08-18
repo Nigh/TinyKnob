@@ -55,6 +55,20 @@ void cdc_log_print(char* str) {
 	tud_cdc_n_write_str(0, str);
 }
 
+// Blocking write for rare dumps — waits until CDC has room so lines are not truncated.
+void cdc_log_print_wait(char* str) {
+	if(!usb_mounted) {
+		return;
+	}
+	uint16_t len = (uint16_t)strlen(str);
+	while(tud_cdc_n_write_available(0) < len) {
+		tud_task();
+		tud_cdc_n_write_flush(0);
+	}
+	tud_cdc_n_write(0, str, len);
+	tud_cdc_n_write_flush(0);
+}
+
 //--------------------------------------------------------------------+
 // Device callbacks
 //--------------------------------------------------------------------+

@@ -37,9 +37,20 @@
 #define SPRING_D 0.05f
 #define SPRING_UQ_MAX 0.35f
 #define SPRING_VEL_LP_HZ 50.f
+// ponytail: voltage-mode SPIN cannot be a true freewheel. Kv must stay < ke or a
+// touch self-spins / hunt when held. Ceiling: draggy coast. Full feel needs Iq≈0
+// current loop on CSA/CSB/CSC (not wired). Uq=0 is LS brake (no INLx Hi-Z).
+#define SPIN_KV 0.020f
+#define SPIN_B 0.002f
+#define SPIN_W_REST 0.10f
+#define SPIN_W_MAX 25.f
+#define SPIN_B_CAP 0.08f
+#define SPIN_UQ_MAX 0.50f
+#define SPIN_VEL_LP_HZ 120.f
 #define CRC_FAIL_TRIP 200u
 
-// ponytail: CSA/CSB/CSC not wired; ADC current loop later. Do not assign GPIOs until the analog traces exist.
+// ponytail: CSA/CSB/CSC not wired; ADC Iq loop later (required for real SPIN freewheel).
+// Do not assign GPIOs until the analog traces exist.
 // #define PIN_CSA
 // #define PIN_CSB
 // #define PIN_CSC

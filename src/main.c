@@ -163,6 +163,14 @@ static void serial_handle_line(const char* line) {
 		}
 		return;
 	}
+	if(strcmp(line, "SPIN") == 0) {
+		if(motor_cmd_spin()) {
+			LOG_RAW("SPIN\n");
+		} else {
+			LOG_RAW("need START\n");
+		}
+		return;
+	}
 	if(strcmp(line, "TEST") == 0) {
 		if(motor_cmd_test()) {
 			LOG_RAW("TEST\n");
@@ -218,7 +226,7 @@ int main() {
 	add_repeating_timer_us(249978ul, timer_4hz_callback, NULL, &timer);
 	tusb_init();
 	cdc_log_init();
-	LOG_RAW("idle: START SPRING TEST STOP DUMP + newline\n");
+	LOG_RAW("idle: START SPRING SPIN TEST STOP DUMP + newline\n");
 	while(true) {
 		app_sched_execute();
 		tud_task();

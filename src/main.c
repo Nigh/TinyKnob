@@ -270,7 +270,9 @@ int main() {
 	add_repeating_timer_us(249978ul, timer_4hz_callback, NULL, &timer);
 	tusb_init();
 	cdc_log_init();
-	LOG_RAW("boot: auto START; Bulk Vendor + CDC SPRING SPIN TEST GOTO STOP DUMP UPLOAD\n");
+	LOG_RAW("boot: auto START after 500ms; Bulk Vendor + CDC SPRING SPIN TEST GOTO STOP DUMP UPLOAD\n");
+	// ponytail: wait for rails/encoder to settle before align.
+	sleep_ms(500);
 	motor_start();
 	while(true) {
 		app_sched_execute();

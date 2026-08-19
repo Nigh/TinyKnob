@@ -9,8 +9,8 @@ Host software can be written from this document alone. Firmware implements exact
 | VID | `0xACDC` |
 | PID | `0x4011` |
 | USB | Full Speed 2.0 |
-| Manufacturer | `Volwave` |
-| Product | `VBTT Device` |
+| Manufacturer | `HelloWorks` |
+| Product | `TinyRoller` |
 
 PID bits: `0x4000 | CDC | VENDOR` (HID removed).
 
@@ -28,7 +28,7 @@ Configuration 1 has two functional interfaces:
 | OUT (host → device) | `0x01` | Bulk | 64 |
 | IN (device → host) | `0x81` | Bulk | 64 |
 
-Interface string: `VBTT Vendor` (index 5).
+Interface string: `TinyRoller Vendor` (index 5).
 
 All multi-byte fields are **little-endian**.
 

@@ -4,6 +4,7 @@ RP2040-Zero + DRV8316 + MT6701 force-feedback knob.
 
 `PID=0x4011`
 `VID=0xACDC`
+Manufacturer `HelloWorks`, Product `TinyRoller`.
 
 USB binary protocol (Vendor Bulk telemetry + commands): see [docs/usb-protocol.md](docs/usb-protocol.md).
 

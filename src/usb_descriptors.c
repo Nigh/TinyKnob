@@ -130,11 +130,11 @@ enum {
 // array of pointer to string descriptors
 char const* string_desc_arr[] = {
 	(const char[]) {0x09, 0x04}, // 0: is supported language is English (0x0409)
-	"Volwave", // 1: Manufacturer
-	"VBTT Device", // 2: Product
+	"HelloWorks", // 1: Manufacturer
+	"TinyRoller", // 2: Product
 	"000001", // 3: Serials, should use chip ID
-	"VBTT CDC", // 4: CDC Interface
-	"VBTT Vendor", // 5: Vendor Bulk Interface
+	"TinyRoller CDC", // 4: CDC Interface
+	"TinyRoller Vendor", // 5: Vendor Bulk Interface
 };
 
 static uint16_t _desc_str[32 + 1];

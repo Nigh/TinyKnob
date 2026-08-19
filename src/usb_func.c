@@ -209,8 +209,11 @@ void vendor_task(void) {
 		if(n == 0)
 			break;
 		int rc = vendor_cmd(buf, (uint16_t)n);
-		if(rc >= 0)
-			vendor_send_ack(buf[0], (uint8_t)rc);
+		if(rc >= 0) {
+			// ponytail: successful GOTO is high-rate; skip ACK so Bulk IN stays telem.
+			if(!(buf[0] == 0x06 && rc == 1))
+				vendor_send_ack(buf[0], (uint8_t)rc);
+		}
 	}
 
 	static uint32_t last_us;

@@ -40,6 +40,7 @@ static float align_theta_m;
 static int32_t pulse_pos0;
 static int32_t home_pos;
 static bool test_fwd;
+static uint8_t stress_phase;
 static int32_t move_start;
 static int32_t move_target;
 static int32_t rest_pos;
@@ -61,6 +62,7 @@ static bool te_from_encoder;
 static volatile float duty_a_cached;
 static volatile float duty_b_cached;
 static volatile float duty_c_cached;
+static volatile int32_t track_pos;
 static bool enc_ok_this;
 
 static uint32_t ms_to_ticks(uint32_t ms) {
@@ -168,13 +170,13 @@ void motor_set_duty(float a, float b, float c) {
 	pwm_set_gpio_level(PIN_PWM_C, duty_to_level(c));
 }
 
-// ponytail: no INLx — cannot Hi-Z. IDLE holds INHx low (LS on). Mid PWM switches hard and wastes watts.
+// ponytail: no INLx Hi-Z. Idle = 50% zero-voltage PWM (~+0.01 W vs LS brake on this board).
 static void motor_brake_low(void) {
 	ud_cmd = 0.f;
 	uq_cmd = 0.f;
 	forced_te = 0.f;
 	te_from_encoder = false;
-	motor_set_duty(0.f, 0.f, 0.f);
+	motor_set_duty(0.5f, 0.5f, 0.5f);
 }
 
 void motor_get_state(motor_state_t* s) {
@@ -238,14 +240,14 @@ static void sincos_lut(float te, float* s_out, float* c_out) {
 
 static void apply_voltage(float ud, float uq, float te) {
 	float mag2 = ud * ud + uq * uq;
-	// ponytail: 0% duty is LS brake. SPIN needs tiny PWM to follow BEMF; spring keeps the deadzone.
+	// Deadzone / U=0 → 50% zero-voltage PWM (same as idle). SPIN keeps a tiny floor for BEMF follow.
 	if(mode == MOTOR_SPIN) {
 		if(mag2 < 1.0e-12f) {
-			motor_set_duty(0.f, 0.f, 0.f);
+			motor_set_duty(0.5f, 0.5f, 0.5f);
 			return;
 		}
 	} else if(mag2 < PWM_MIN_MAG2) {
-		motor_set_duty(0.f, 0.f, 0.f);
+		motor_set_duty(0.5f, 0.5f, 0.5f);
 		return;
 	}
 	if(mag2 > 1.f) {
@@ -275,6 +277,24 @@ static void apply_cmd(void) {
 
 static void enter_mode(uint8_t next) {
 	mode = next;
+	mode_tick = 0;
+}
+
+// 5th-order smoothstep s=10t³−15t⁴+6t⁵ (zero accel at ends).
+static float smoothstep5(float t) {
+	if(t <= 0.f)
+		return 0.f;
+	if(t >= 1.f)
+		return 1.f;
+	float t2 = t * t;
+	float t3 = t2 * t;
+	float t4 = t3 * t;
+	float t5 = t4 * t;
+	return 10.f * t3 - 15.f * t4 + 6.f * t5;
+}
+
+static void stress_advance(uint8_t next) {
+	stress_phase = next;
 	mode_tick = 0;
 }
 
@@ -353,7 +373,7 @@ static void motor_isr(void) {
 	mt6701_start_read();
 
 	if(mode == MOTOR_IDLE || mode == MOTOR_FAULT) {
-		// Keep INHx low; wrap IRQ still runs for SSI. No mid-PWM switching.
+		// Outputs already at 50% from motor_brake_low; wrap IRQ still paces SSI.
 		return;
 	}
 
@@ -462,6 +482,16 @@ static void motor_isr(void) {
 				start_move(test_fwd ? home_pos + COUNTS_PER_REV : home_pos, MOTOR_TEST);
 			}
 			break;
+		case MOTOR_POS: {
+			// ponytail: P+D toward track_pos each PWM tick. Ceiling: lag on fast sim;
+			// upgrade = host ω feedforward in the GOTO payload.
+			float err = (float)(track_pos - pos) * RAD_PER_COUNT;
+			float vel = vel_update(SPRING_VEL_ALPHA);
+			ud_cmd = 0.f;
+			uq_cmd = clampf(err * POS_KP - SPRING_D * vel, -TEST_UQ_MAX, TEST_UQ_MAX);
+			te_from_encoder = true;
+			break;
+		}
 		case MOTOR_SPRING: {
 			float vel = vel_update(SPRING_VEL_ALPHA);
 			ud_cmd = 0.f;
@@ -473,6 +503,75 @@ static void motor_isr(void) {
 			ud_cmd = 0.f;
 			uq_cmd = spin_uq(vel_update(SPIN_VEL_ALPHA));
 			te_from_encoder = true;
+			break;
+		}
+		case MOTOR_STRESS: {
+			// phases: ramp+ / run+ / ramp0 / stop / ramp- / run- / ramp0 / stop → loop
+			ud_cmd = 0.f;
+			te_from_encoder = true;
+			uint32_t ramp = ms_to_ticks(STRESS_RAMP_MS);
+			uint32_t run = ms_to_ticks(STRESS_RUN_MS);
+			uint32_t stop = ms_to_ticks(STRESS_STOP_MS);
+			if(ramp == 0)
+				ramp = 1;
+			if(run == 0)
+				run = 1;
+			if(stop == 0)
+				stop = 1;
+			switch(stress_phase) {
+				case 0: { // ramp to +full
+					float s = smoothstep5((float)mode_tick / (float)ramp);
+					uq_cmd = STRESS_UQ_MAX * s;
+					if(mode_tick >= ramp)
+						stress_advance(1);
+					break;
+				}
+				case 1: // hold +full
+					uq_cmd = STRESS_UQ_MAX;
+					if(mode_tick >= run)
+						stress_advance(2);
+					break;
+				case 2: { // ramp +full → 0
+					float s = smoothstep5((float)mode_tick / (float)ramp);
+					uq_cmd = STRESS_UQ_MAX * (1.f - s);
+					if(mode_tick >= ramp)
+						stress_advance(3);
+					break;
+				}
+				case 3: // stop
+					uq_cmd = 0.f;
+					if(mode_tick >= stop)
+						stress_advance(4);
+					break;
+				case 4: { // ramp to -full
+					float s = smoothstep5((float)mode_tick / (float)ramp);
+					uq_cmd = -STRESS_UQ_MAX * s;
+					if(mode_tick >= ramp)
+						stress_advance(5);
+					break;
+				}
+				case 5: // hold -full
+					uq_cmd = -STRESS_UQ_MAX;
+					if(mode_tick >= run)
+						stress_advance(6);
+					break;
+				case 6: { // ramp -full → 0
+					float s = smoothstep5((float)mode_tick / (float)ramp);
+					uq_cmd = -STRESS_UQ_MAX * (1.f - s);
+					if(mode_tick >= ramp)
+						stress_advance(7);
+					break;
+				}
+				case 7: // stop, then loop
+					uq_cmd = 0.f;
+					if(mode_tick >= stop)
+						stress_advance(0);
+					break;
+				default:
+					stress_advance(0);
+					uq_cmd = 0.f;
+					break;
+			}
 			break;
 		}
 		default:
@@ -547,6 +646,53 @@ bool motor_cmd_test(void) {
 	return true;
 }
 
+bool motor_cmd_stress(void) {
+	if(!aligned || mode == MOTOR_FAULT || is_aligning())
+		return false;
+	irq_set_enabled(PWM_IRQ_WRAP, false);
+	stress_phase = 0;
+	enter_mode(MOTOR_STRESS);
+	irq_set_enabled(PWM_IRQ_WRAP, true);
+	return true;
+}
+
+bool motor_cmd_goto(int32_t angle_mrad) {
+	if(!aligned || mode == MOTOR_FAULT || is_aligning())
+		return false;
+	int32_t target = (int32_t)((float)angle_mrad / (RAD_PER_COUNT * 1000.f));
+	irq_set_enabled(PWM_IRQ_WRAP, false);
+	track_pos = target;
+	if(mode != MOTOR_POS) {
+		pos_last = pos;
+		vel_filt = 0.f;
+		enter_mode(MOTOR_POS);
+	}
+	irq_set_enabled(PWM_IRQ_WRAP, true);
+	return true;
+}
+
+static bool pos_selfcheck(void) {
+	// One mech rev ↔ mrad ↔ counts (telemetry units).
+	int32_t mrad = (int32_t)((float)COUNTS_PER_REV * RAD_PER_COUNT * 1000.f);
+	int32_t back = (int32_t)((float)mrad / (RAD_PER_COUNT * 1000.f));
+	int32_t err = back - (int32_t)COUNTS_PER_REV;
+	if(err < 0)
+		err = -err;
+	return err <= 2;
+}
+
+static bool stress_selfcheck(void) {
+	if(smoothstep5(0.f) != 0.f || smoothstep5(1.f) != 1.f)
+		return false;
+	if(smoothstep5(0.5f) < 0.4f || smoothstep5(0.5f) > 0.6f)
+		return false;
+	if(STRESS_UQ_MAX <= 0.f || STRESS_UQ_MAX > 1.f)
+		return false;
+	if(STRESS_RAMP_MS == 0 || STRESS_RUN_MS == 0 || STRESS_STOP_MS == 0)
+		return false;
+	return true;
+}
+
 void motor_setup(void) {
 	// ponytail: 1024-pt sin LUT (~4KB); cos = lut[i+N/4]. Ceiling: ~0.35°; upgrade = lerp.
 	for(uint32_t i = 0; i < SIN_LUT_N; i++)
@@ -555,6 +701,10 @@ void motor_setup(void) {
 		LOG_RAW("spring selfcheck FAIL\n");
 	if(!spin_selfcheck())
 		LOG_RAW("spin selfcheck FAIL\n");
+	if(!pos_selfcheck())
+		LOG_RAW("pos selfcheck FAIL\n");
+	if(!stress_selfcheck())
+		LOG_RAW("stress selfcheck FAIL\n");
 
 	gpio_init(PIN_DRV_EN);
 	gpio_set_dir(PIN_DRV_EN, GPIO_OUT);
@@ -591,7 +741,7 @@ void motor_setup(void) {
 	irq_set_exclusive_handler(PWM_IRQ_WRAP, pwm_wrap_isr);
 	irq_set_enabled(PWM_IRQ_WRAP, true);
 
-	// Enable counters for SSI pacing; outputs stay low at 0% duty (no FET switching)
+	// Enable counters for SSI pacing; idle outputs sit at 50% zero-voltage PWM
 	pwm_set_mask_enabled(pwm_enable_mask);
 	mt6701_start_read();
 }

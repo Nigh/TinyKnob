@@ -79,6 +79,7 @@ Total size: **16 bytes**.
 | 7 | `MOTOR_SPIN` | Voltage-mode flywheel |
 | 8 | `MOTOR_FAULT` | Fault (CRC etc.); brake |
 | 9 | `MOTOR_POS` | Track absolute angle (streaming setpoint) |
+| 10 | `MOTOR_STRESS` | Burn-in: +full / stop / −full / stop with smooth Uq ramps |
 
 ## Command frames (host → device, Bulk OUT)
 
@@ -92,6 +93,7 @@ Each command is one Bulk OUT transfer. Byte 0 is the opcode; payload follows imm
 | `0x04` | `SPIN` | none | Enter spin (needs prior align) |
 | `0x05` | `TEST` | none | Enter TEST (needs prior align) |
 | `0x06` | `GOTO` | `i32 angle_mrad` (LE) | Enter/stay in `MOTOR_POS` and set tracking target (needs prior align) |
+| `0x07` | `STRESS` | none | Enter burn-in loop (needs prior align): +full 3s, stop 1s, −full 3s, stop 1s; 500ms smoothstep Uq on start/stop |
 | `0x20` | `SET_K` | `u8 k_x10` | Spring stiffness `K = k_x10 / 10` (clamped 0…8) |
 | `0x21` | `SET_REST` | none | Set spring rest angle to current position |
 | `0x7F` | `UPLOAD` | none | Reboot into UF2 bootloader (same as CDC `UPLOAD`) |
@@ -102,7 +104,7 @@ Each command is one Bulk OUT transfer. Byte 0 is the opcode; payload follows imm
 - Example: `+π` rad ≈ `3142` mrad → bytes `06 4E 0C 00 00` (`0x06` + LE `0x00000C4E`).
 - **Tracking mode** (not a timed trajectory): each PWM tick (~20 kHz) applies P+D toward the latest target. Safe to stream at **hundreds of Hz to ~1 kHz** from the host to follow a simulated wheel.
 - First accepted `GOTO` enters `MOTOR_POS`; later `GOTO`s only update the setpoint (no mode restart).
-- Exit with `STOP` or another mode command (`SPRING` / `SPIN` / `TEST` / `START`).
+- Exit with `STOP` or another mode command (`SPRING` / `SPIN` / `TEST` / `STRESS` / `START`).
 - Successful `GOTO` does **not** emit an ACK (keeps Bulk IN free for telemetry). Rejected `GOTO` still ACKs with `status=0`. Watch telem `mode == 9` to confirm tracking.
 
 ### Short ACK (optional)
@@ -122,14 +124,14 @@ Exception: successful `GOTO` (`0x06`, `status` would be 1) sends **no** ACK. `UP
 ### Failure semantics
 
 - `START` / `STOP` / `SET_K` / `SET_REST` always succeed at the protocol layer (`status=1`).
-- `SPRING` / `SPIN` / `TEST` / `GOTO` return `status=0` if the motor is not aligned/armed yet (same as CDC `need START`), or if `GOTO` payload is fewer than 4 bytes. Successful `GOTO` skips ACK entirely.
+- `SPRING` / `SPIN` / `TEST` / `STRESS` / `GOTO` return `status=0` if the motor is not aligned/armed yet (same as CDC `need START`), or if `GOTO` payload is fewer than 4 bytes. Successful `GOTO` skips ACK entirely.
 - `UPLOAD` reboots into UF2; no ACK. Host should wait for the device to reappear as a mass-storage / picoboot target.
 - Unknown `cmd`: no ACK; ignored.
 - Empty OUT transfer: ignored.
 
 ## CDC side channel (debug only)
 
-CDC remains for logs. Text lines ending in `\n` or `\r` still accept: `START`, `STOP`, `SPRING`, `SPIN`, `TEST`, `GOTO <mrad>`, `DUMP`, `UPLOAD`. Binary hosts should use Vendor Bulk only.
+CDC remains for logs. Text lines ending in `\n` or `\r` still accept: `START`, `STOP`, `SPRING`, `SPIN`, `TEST`, `STRESS`, `GOTO <mrad>`, `DUMP`, `UPLOAD`. Binary hosts should use Vendor Bulk only.
 
 Example: stream `GOTO 3142` (or Bulk `0x06` + LE int32) at your sim rate to track about +π rad absolute.
 
@@ -214,6 +216,7 @@ enum {
 	TK_CMD_SPIN     = 0x04,
 	TK_CMD_TEST     = 0x05,
 	TK_CMD_GOTO     = 0x06,
+	TK_CMD_STRESS   = 0x07,
 	TK_CMD_SET_K    = 0x20,
 	TK_CMD_SET_REST = 0x21,
 	TK_CMD_UPLOAD   = 0x7F,

@@ -40,6 +40,7 @@ static float align_theta_m;
 static int32_t pulse_pos0;
 static int32_t home_pos;
 static bool test_fwd;
+static uint8_t stress_phase;
 static int32_t move_start;
 static int32_t move_target;
 static int32_t rest_pos;
@@ -279,6 +280,24 @@ static void enter_mode(uint8_t next) {
 	mode_tick = 0;
 }
 
+// 5th-order smoothstep s=10t³−15t⁴+6t⁵ (zero accel at ends).
+static float smoothstep5(float t) {
+	if(t <= 0.f)
+		return 0.f;
+	if(t >= 1.f)
+		return 1.f;
+	float t2 = t * t;
+	float t3 = t2 * t;
+	float t4 = t3 * t;
+	float t5 = t4 * t;
+	return 10.f * t3 - 15.f * t4 + 6.f * t5;
+}
+
+static void stress_advance(uint8_t next) {
+	stress_phase = next;
+	mode_tick = 0;
+}
+
 static void start_move(int32_t target, uint8_t next) {
 	move_start = pos;
 	move_target = target;
@@ -486,6 +505,75 @@ static void motor_isr(void) {
 			te_from_encoder = true;
 			break;
 		}
+		case MOTOR_STRESS: {
+			// phases: ramp+ / run+ / ramp0 / stop / ramp- / run- / ramp0 / stop → loop
+			ud_cmd = 0.f;
+			te_from_encoder = true;
+			uint32_t ramp = ms_to_ticks(STRESS_RAMP_MS);
+			uint32_t run = ms_to_ticks(STRESS_RUN_MS);
+			uint32_t stop = ms_to_ticks(STRESS_STOP_MS);
+			if(ramp == 0)
+				ramp = 1;
+			if(run == 0)
+				run = 1;
+			if(stop == 0)
+				stop = 1;
+			switch(stress_phase) {
+				case 0: { // ramp to +full
+					float s = smoothstep5((float)mode_tick / (float)ramp);
+					uq_cmd = STRESS_UQ_MAX * s;
+					if(mode_tick >= ramp)
+						stress_advance(1);
+					break;
+				}
+				case 1: // hold +full
+					uq_cmd = STRESS_UQ_MAX;
+					if(mode_tick >= run)
+						stress_advance(2);
+					break;
+				case 2: { // ramp +full → 0
+					float s = smoothstep5((float)mode_tick / (float)ramp);
+					uq_cmd = STRESS_UQ_MAX * (1.f - s);
+					if(mode_tick >= ramp)
+						stress_advance(3);
+					break;
+				}
+				case 3: // stop
+					uq_cmd = 0.f;
+					if(mode_tick >= stop)
+						stress_advance(4);
+					break;
+				case 4: { // ramp to -full
+					float s = smoothstep5((float)mode_tick / (float)ramp);
+					uq_cmd = -STRESS_UQ_MAX * s;
+					if(mode_tick >= ramp)
+						stress_advance(5);
+					break;
+				}
+				case 5: // hold -full
+					uq_cmd = -STRESS_UQ_MAX;
+					if(mode_tick >= run)
+						stress_advance(6);
+					break;
+				case 6: { // ramp -full → 0
+					float s = smoothstep5((float)mode_tick / (float)ramp);
+					uq_cmd = -STRESS_UQ_MAX * (1.f - s);
+					if(mode_tick >= ramp)
+						stress_advance(7);
+					break;
+				}
+				case 7: // stop, then loop
+					uq_cmd = 0.f;
+					if(mode_tick >= stop)
+						stress_advance(0);
+					break;
+				default:
+					stress_advance(0);
+					uq_cmd = 0.f;
+					break;
+			}
+			break;
+		}
 		default:
 			break;
 	}
@@ -558,6 +646,16 @@ bool motor_cmd_test(void) {
 	return true;
 }
 
+bool motor_cmd_stress(void) {
+	if(!aligned || mode == MOTOR_FAULT || is_aligning())
+		return false;
+	irq_set_enabled(PWM_IRQ_WRAP, false);
+	stress_phase = 0;
+	enter_mode(MOTOR_STRESS);
+	irq_set_enabled(PWM_IRQ_WRAP, true);
+	return true;
+}
+
 bool motor_cmd_goto(int32_t angle_mrad) {
 	if(!aligned || mode == MOTOR_FAULT || is_aligning())
 		return false;
@@ -583,6 +681,18 @@ static bool pos_selfcheck(void) {
 	return err <= 2;
 }
 
+static bool stress_selfcheck(void) {
+	if(smoothstep5(0.f) != 0.f || smoothstep5(1.f) != 1.f)
+		return false;
+	if(smoothstep5(0.5f) < 0.4f || smoothstep5(0.5f) > 0.6f)
+		return false;
+	if(STRESS_UQ_MAX <= 0.f || STRESS_UQ_MAX > 1.f)
+		return false;
+	if(STRESS_RAMP_MS == 0 || STRESS_RUN_MS == 0 || STRESS_STOP_MS == 0)
+		return false;
+	return true;
+}
+
 void motor_setup(void) {
 	// ponytail: 1024-pt sin LUT (~4KB); cos = lut[i+N/4]. Ceiling: ~0.35°; upgrade = lerp.
 	for(uint32_t i = 0; i < SIN_LUT_N; i++)
@@ -593,6 +703,8 @@ void motor_setup(void) {
 		LOG_RAW("spin selfcheck FAIL\n");
 	if(!pos_selfcheck())
 		LOG_RAW("pos selfcheck FAIL\n");
+	if(!stress_selfcheck())
+		LOG_RAW("stress selfcheck FAIL\n");
 
 	gpio_init(PIN_DRV_EN);
 	gpio_set_dir(PIN_DRV_EN, GPIO_OUT);

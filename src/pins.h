@@ -47,6 +47,11 @@
 #define SPIN_B_CAP 0.08f
 #define SPIN_UQ_MAX 0.50f
 #define SPIN_VEL_LP_HZ 120.f
+// Stress: +full 3s / coast 1s / -full 3s / coast 1s; Uq smoothstep on start & stop.
+#define STRESS_UQ_MAX 0.65f
+#define STRESS_RUN_MS 3000u
+#define STRESS_STOP_MS 1000u
+#define STRESS_RAMP_MS 500u
 #define CRC_FAIL_TRIP 200u
 
 // ponytail: CSA/CSB/CSC not wired; ADC Iq loop later (required for real SPIN freewheel).

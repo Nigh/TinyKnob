@@ -39,7 +39,7 @@ bool timer_4hz_callback(struct repeating_timer* t) {
 #define U32RGB(r, g, b) (((uint32_t)(r) << 8) | ((uint32_t)(g) << 16) | (uint32_t)(b))
 
 // LED: align=orange blink, idle=green, spring=blue, spin=cyan, test=white blink,
-	// pos=yellow (tracking), fault=red. UPLOAD purple is set in enter_uf2_bootloader before bootrom.
+	// pos=yellow (tracking), stress=magenta blink, fault=red. UPLOAD purple is set in enter_uf2_bootloader before bootrom.
 static void led_status(void) {
 	static uint8_t tick;
 	motor_state_t st;
@@ -57,6 +57,10 @@ static void led_status(void) {
 	}
 	if(st.mode == MOTOR_TEST) {
 		ws2812_setpixel(on ? U32RGB(24, 24, 24) : U32RGB(0, 0, 0));
+		return;
+	}
+	if(st.mode == MOTOR_STRESS) {
+		ws2812_setpixel(on ? U32RGB(28, 0, 20) : U32RGB(0, 0, 0));
 		return;
 	}
 	if(st.mode == MOTOR_POS) {
@@ -84,9 +88,9 @@ void main_handler(uevt_t* evt) {
 				motor_state_t st;
 				motor_get_state(&st);
 				tick++;
-				// 4 Hz during align, TEST, POS; else ~1 Hz
+				// 4 Hz during align, TEST, STRESS, POS; else ~1 Hz
 				bool fast = (st.mode >= MOTOR_ALIGN_RAMP && st.mode <= MOTOR_ALIGN_DOWN) ||
-						st.mode == MOTOR_TEST || st.mode == MOTOR_POS;
+						st.mode == MOTOR_TEST || st.mode == MOTOR_STRESS || st.mode == MOTOR_POS;
 				if(fast || (tick & 3) == 0) {
 					LOG_RAW("m%u p%ld o%lu f%lu d%d\n",
 							st.mode, (long)st.pos,
@@ -112,6 +116,7 @@ enum {
 	TK_CMD_SPIN = 0x04,
 	TK_CMD_TEST = 0x05,
 	TK_CMD_GOTO = 0x06,
+	TK_CMD_STRESS = 0x07,
 	TK_CMD_SET_K = 0x20,
 	TK_CMD_SET_REST = 0x21,
 	TK_CMD_UPLOAD = 0x7F,
@@ -151,6 +156,8 @@ int vendor_cmd(uint8_t const* buffer, uint16_t bufsize) {
 			return motor_cmd_spin() ? 1 : 0;
 		case TK_CMD_TEST:
 			return motor_cmd_test() ? 1 : 0;
+		case TK_CMD_STRESS:
+			return motor_cmd_stress() ? 1 : 0;
 		case TK_CMD_GOTO: {
 			if(bufsize < 5)
 				return 0;
@@ -205,6 +212,14 @@ static void serial_handle_line(const char* line) {
 	if(strcmp(line, "TEST") == 0) {
 		if(motor_cmd_test()) {
 			LOG_RAW("TEST\n");
+		} else {
+			LOG_RAW("need START\n");
+		}
+		return;
+	}
+	if(strcmp(line, "STRESS") == 0) {
+		if(motor_cmd_stress()) {
+			LOG_RAW("STRESS\n");
 		} else {
 			LOG_RAW("need START\n");
 		}
@@ -270,7 +285,7 @@ int main() {
 	add_repeating_timer_us(249978ul, timer_4hz_callback, NULL, &timer);
 	tusb_init();
 	cdc_log_init();
-	LOG_RAW("boot: auto START after 500ms; Bulk Vendor + CDC SPRING SPIN TEST GOTO STOP DUMP UPLOAD\n");
+	LOG_RAW("boot: auto START after 500ms; Bulk Vendor + CDC SPRING SPIN TEST STRESS GOTO STOP DUMP UPLOAD\n");
 	// ponytail: wait for rails/encoder to settle before align.
 	sleep_ms(500);
 	motor_start();

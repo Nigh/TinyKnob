@@ -168,13 +168,13 @@ void motor_set_duty(float a, float b, float c) {
 	pwm_set_gpio_level(PIN_PWM_C, duty_to_level(c));
 }
 
-// ponytail: no INLx — cannot Hi-Z. IDLE holds INHx low (LS on). Mid PWM switches hard and wastes watts.
+// ponytail: no INLx Hi-Z. Idle = 50% zero-voltage PWM (~+0.01 W vs LS brake on this board).
 static void motor_brake_low(void) {
 	ud_cmd = 0.f;
 	uq_cmd = 0.f;
 	forced_te = 0.f;
 	te_from_encoder = false;
-	motor_set_duty(0.f, 0.f, 0.f);
+	motor_set_duty(0.5f, 0.5f, 0.5f);
 }
 
 void motor_get_state(motor_state_t* s) {
@@ -238,14 +238,14 @@ static void sincos_lut(float te, float* s_out, float* c_out) {
 
 static void apply_voltage(float ud, float uq, float te) {
 	float mag2 = ud * ud + uq * uq;
-	// ponytail: 0% duty is LS brake. SPIN needs tiny PWM to follow BEMF; spring keeps the deadzone.
+	// Deadzone / U=0 → 50% zero-voltage PWM (same as idle). SPIN keeps a tiny floor for BEMF follow.
 	if(mode == MOTOR_SPIN) {
 		if(mag2 < 1.0e-12f) {
-			motor_set_duty(0.f, 0.f, 0.f);
+			motor_set_duty(0.5f, 0.5f, 0.5f);
 			return;
 		}
 	} else if(mag2 < PWM_MIN_MAG2) {
-		motor_set_duty(0.f, 0.f, 0.f);
+		motor_set_duty(0.5f, 0.5f, 0.5f);
 		return;
 	}
 	if(mag2 > 1.f) {
@@ -353,7 +353,7 @@ static void motor_isr(void) {
 	mt6701_start_read();
 
 	if(mode == MOTOR_IDLE || mode == MOTOR_FAULT) {
-		// Keep INHx low; wrap IRQ still runs for SSI. No mid-PWM switching.
+		// Outputs already at 50% from motor_brake_low; wrap IRQ still paces SSI.
 		return;
 	}
 
@@ -591,7 +591,7 @@ void motor_setup(void) {
 	irq_set_exclusive_handler(PWM_IRQ_WRAP, pwm_wrap_isr);
 	irq_set_enabled(PWM_IRQ_WRAP, true);
 
-	// Enable counters for SSI pacing; outputs stay low at 0% duty (no FET switching)
+	// Enable counters for SSI pacing; idle outputs sit at 50% zero-voltage PWM
 	pwm_set_mask_enabled(pwm_enable_mask);
 	mt6701_start_read();
 }

@@ -63,7 +63,7 @@ Total size: **16 bytes**.
 ### Units
 
 - **Physical angle**: `angle_mrad = round(pos * (2π / 16384) * 1000)` where `pos` is the unwrapped MT6701 count (14-bit sensor, unwrapped in firmware). Positive direction follows encoder increase. Not wrapped to ±π; it grows with turns.
-- **Duty Q15**: duty cycle in `[0, 1]` mapped as `q15 = (int16_t)(duty * 32767)`. Midpoint `0.5` ≈ `16383` is zero voltage in the inverse-Park path. `0` is low-side brake (all INHx low).
+- **Duty Q15**: duty cycle in `[0, 1]` mapped as `q15 = (int16_t)(duty * 32767)`. Midpoint `0.5` ≈ `16383` is zero line-to-line voltage (idle, deadzone, and `U≈0`). Active drive swings around this midpoint.
 
 ### Mode values (`mode`)
 

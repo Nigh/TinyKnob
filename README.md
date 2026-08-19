@@ -51,7 +51,7 @@ make rebuild
 
 ## Usage
 
-On power-up the firmware runs align automatically (`START`), then returns to IDLE (armed, green LED). Switch feel with `SPRING` / `SPIN` / `TEST` / `STOP`. Continuous SSI CRC failures trip FAULT (red LED) and return to low-side brake idle. True phase Hi-Z needs INLx wired later.
+On power-up the firmware runs align automatically (`START`), then returns to IDLE (armed, green LED). Switch feel with `SPRING` / `SPIN` / `TEST` / `STOP`. Continuous SSI CRC failures trip FAULT (red LED) and return to idle at 50% zero-voltage PWM. True phase Hi-Z needs INLx wired later.
 
 LED (WS2812): orange blink = aligning; green = idle; blue = spring; cyan = spin; white blink = TEST; red = fault; purple = UPLOAD (before bootrom).
 
@@ -75,7 +75,7 @@ CDC commands (line ending `\n` or `\r`) remain for debug:
 - `SPRING` virtual spring at current angle (needs align)
 - `SPIN` voltage-mode flywheel (needs align). Under-compensates BEMF so it will not
   self-spin; feel is draggy until an `Iq` current loop can hold `Iq≈0` (needs CSA/CSB/CSC).
-  `Uq=0` is low-side brake (no INLx Hi-Z yet).
+  `Uq=0` / idle use 50% zero-voltage PWM (no INLx Hi-Z yet).
 - `TEST` loop ±360° with 5th-order ease (~1.4s move + ≤200ms hold) (needs align)
 - `STOP` brake / idle, keep align
 - `DUMP` print one full SSI frame (bits + shift candidates), waits on CDC so lines are complete

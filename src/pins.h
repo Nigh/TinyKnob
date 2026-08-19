@@ -39,7 +39,7 @@
 #define SPRING_VEL_LP_HZ 50.f
 // ponytail: voltage-mode SPIN cannot be a true freewheel. Kv must stay < ke or a
 // touch self-spins / hunt when held. Ceiling: draggy coast. Full feel needs Iq≈0
-// current loop on CSA/CSB/CSC (not wired). Uq=0 is LS brake (no INLx Hi-Z).
+// current loop on CSA/CSB/CSC (not wired). Uq=0 / idle → 50% zero-voltage PWM (no INLx Hi-Z).
 #define SPIN_KV 0.020f
 #define SPIN_B 0.002f
 #define SPIN_W_REST 0.10f

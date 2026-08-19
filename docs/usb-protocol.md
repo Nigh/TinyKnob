@@ -94,6 +94,7 @@ Each command is one Bulk OUT transfer. Byte 0 is the opcode; payload follows imm
 | `0x06` | `GOTO` | `i32 angle_mrad` (LE) | Enter/stay in `MOTOR_POS` and set tracking target (needs prior align) |
 | `0x20` | `SET_K` | `u8 k_x10` | Spring stiffness `K = k_x10 / 10` (clamped 0…8) |
 | `0x21` | `SET_REST` | none | Set spring rest angle to current position |
+| `0x7F` | `UPLOAD` | none | Reboot into UF2 bootloader (same as CDC `UPLOAD`) |
 
 ### GOTO / tracking details
 
@@ -116,12 +117,13 @@ After a command, the device may write a 3-byte packet on Bulk IN:
 
 Hosts **may ignore** ACKs. Distinguish from telemetry by `magic`: `0xA5` = telem, `0x5A` = ack. If a read returns a length other than 16, or magic is `0x5A`, treat as ack (or skip).
 
-Exception: successful `GOTO` (`0x06`, `status` would be 1) sends **no** ACK.
+Exception: successful `GOTO` (`0x06`, `status` would be 1) sends **no** ACK. `UPLOAD` (`0x7F`) also sends **no** ACK — the device reboots into bootrom before a reply can go out.
 
 ### Failure semantics
 
 - `START` / `STOP` / `SET_K` / `SET_REST` always succeed at the protocol layer (`status=1`).
 - `SPRING` / `SPIN` / `TEST` / `GOTO` return `status=0` if the motor is not aligned/armed yet (same as CDC `need START`), or if `GOTO` payload is fewer than 4 bytes. Successful `GOTO` skips ACK entirely.
+- `UPLOAD` reboots into UF2; no ACK. Host should wait for the device to reappear as a mass-storage / picoboot target.
 - Unknown `cmd`: no ACK; ignored.
 - Empty OUT transfer: ignored.
 
@@ -214,5 +216,6 @@ enum {
 	TK_CMD_GOTO     = 0x06,
 	TK_CMD_SET_K    = 0x20,
 	TK_CMD_SET_REST = 0x21,
+	TK_CMD_UPLOAD   = 0x7F,
 };
 ```

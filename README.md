@@ -67,6 +67,7 @@ Vendor Bulk OUT opcodes:
 - `0x06` GOTO, next 4 bytes = absolute `angle_mrad` (LE int32); tracking setpoint (streamable)
 - `0x20` SET_K, byte 1 = K * 10
 - `0x21` SET_REST to current angle
+- `0x7F` UPLOAD reboot to UF2 bootloader (no ACK; device disconnects)
 
 Bulk IN pushes 16-byte frames (~1 kHz): magic `0xA5`, mode, angle_mrad, phase duties Q15, seq.
 

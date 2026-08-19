@@ -39,7 +39,7 @@ bool timer_4hz_callback(struct repeating_timer* t) {
 #define U32RGB(r, g, b) (((uint32_t)(r) << 8) | ((uint32_t)(g) << 16) | (uint32_t)(b))
 
 // LED: align=orange blink, idle=green, spring=blue, spin=cyan, test=white blink,
-	// pos=yellow (tracking), fault=red. UPLOAD purple is set in serial_handle_line before bootrom.
+	// pos=yellow (tracking), fault=red. UPLOAD purple is set in enter_uf2_bootloader before bootrom.
 static void led_status(void) {
 	static uint8_t tick;
 	motor_state_t st;
@@ -114,7 +114,13 @@ enum {
 	TK_CMD_GOTO = 0x06,
 	TK_CMD_SET_K = 0x20,
 	TK_CMD_SET_REST = 0x21,
+	TK_CMD_UPLOAD = 0x7F,
 };
+
+static void enter_uf2_bootloader(void) {
+	ws2812_setpixel(U32RGB(20, 0, 20));
+	reset_usb_boot(0, 0);
+}
 
 int vendor_cmd(uint8_t const* buffer, uint16_t bufsize) {
 	if(bufsize < 1)
@@ -159,6 +165,9 @@ int vendor_cmd(uint8_t const* buffer, uint16_t bufsize) {
 		case TK_CMD_SET_REST:
 			motor_set_rest_to_current();
 			return 1;
+		case TK_CMD_UPLOAD:
+			enter_uf2_bootloader(); // noreturn
+			return 1;
 		default:
 			return -1;
 	}
@@ -169,8 +178,7 @@ static uint8_t serial_line_len;
 
 static void serial_handle_line(const char* line) {
 	if(strcmp(line, "UPLOAD") == 0) {
-		ws2812_setpixel(U32RGB(20, 0, 20));
-		reset_usb_boot(0, 0);
+		enter_uf2_bootloader();
 		return;
 	}
 	if(strcmp(line, "START") == 0) {

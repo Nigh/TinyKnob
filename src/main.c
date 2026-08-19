@@ -37,28 +37,43 @@ bool timer_4hz_callback(struct repeating_timer* t) {
 
 #define U32RGB(r, g, b) (((uint32_t)(r) << 8) | ((uint32_t)(g) << 16) | (uint32_t)(b))
 
-void led_blink_routine(void) {
-	static uint8_t _tick = 0;
+// LED: align=orange blink, idle=green, spring=blue, spin=cyan, test=white blink, fault=red.
+// UPLOAD purple is set in serial_handle_line before bootrom.
+static void led_status(void) {
+	static uint8_t tick;
 	motor_state_t st;
 	motor_get_state(&st);
-	_tick += 1;
-	if((_tick & 0x1) == 0) {
-		ws2812_setpixel(U32RGB(0, 0, 0));
+	tick++;
+	bool on = (tick & 1u) != 0;
+
+	if(st.mode == MOTOR_FAULT) {
+		ws2812_setpixel(U32RGB(40, 0, 0));
 		return;
 	}
-	if(st.mode == MOTOR_FAULT) {
-		ws2812_setpixel(U32RGB(32, 0, 0));
-	} else if(usb_mounted) {
-		ws2812_setpixel(U32RGB(4, 14, 4));
-	} else {
-		ws2812_setpixel(U32RGB(20, 20, 2));
+	if(st.mode >= MOTOR_ALIGN_RAMP && st.mode <= MOTOR_ALIGN_DOWN) {
+		ws2812_setpixel(on ? U32RGB(36, 14, 0) : U32RGB(0, 0, 0));
+		return;
 	}
+	if(st.mode == MOTOR_TEST) {
+		ws2812_setpixel(on ? U32RGB(24, 24, 24) : U32RGB(0, 0, 0));
+		return;
+	}
+	if(st.mode == MOTOR_SPRING) {
+		ws2812_setpixel(U32RGB(0, 8, 32));
+		return;
+	}
+	if(st.mode == MOTOR_SPIN) {
+		ws2812_setpixel(U32RGB(0, 24, 20));
+		return;
+	}
+	// IDLE (armed) and anything else
+	ws2812_setpixel(U32RGB(0, 22, 0));
 }
 
 void main_handler(uevt_t* evt) {
 	switch(evt->evt_id) {
 		case UEVT_TIMER_4HZ:
-			led_blink_routine();
+			led_status();
 			{
 				static uint8_t tick;
 				motor_state_t st;
@@ -84,60 +99,52 @@ void uevt_log(char* str) {
 }
 
 const char printHex[] = "0123456789ABCDEF";
-#define HID_CMD_GET_STATE 0x10
-#define HID_CMD_SET_K 0x20
-#define HID_CMD_SET_REST 0x21
 
-void hid_receive(uint8_t const* buffer, uint16_t bufsize) {
+enum {
+	TK_CMD_START = 0x01,
+	TK_CMD_STOP = 0x02,
+	TK_CMD_SPRING = 0x03,
+	TK_CMD_SPIN = 0x04,
+	TK_CMD_TEST = 0x05,
+	TK_CMD_SET_K = 0x20,
+	TK_CMD_SET_REST = 0x21,
+};
+
+int vendor_cmd(uint8_t const* buffer, uint16_t bufsize) {
+	if(bufsize < 1)
+		return -1;
+
 	char str[16 * 2 + 1];
-	str[32] = 0;
-	for(uint16_t i = 0; i < 16; i++) {
+	uint16_t dump_n = bufsize < 16 ? bufsize : 16;
+	for(uint16_t i = 0; i < dump_n; i++) {
 		str[i * 2] = printHex[buffer[i] >> 4];
 		str[i * 2 + 1] = printHex[buffer[i] & 0xF];
 	}
-	LOG_RAW("HID[%d]:%s\n", bufsize, str);
+	str[dump_n * 2] = 0;
+	LOG_RAW("VND[%d]:%s\n", bufsize, str);
 
-	if(bufsize < 1)
-		return;
-
-	uint8_t out[64];
-	memset(out, 0, sizeof(out));
 	switch(buffer[0]) {
-		case HID_CMD_GET_STATE: {
-			motor_state_t st;
-			motor_get_state(&st);
-			out[0] = HID_CMD_GET_STATE;
-			out[1] = st.mode;
-			out[2] = (uint8_t)st.dir;
-			out[3] = (uint8_t)st.pos;
-			out[4] = (uint8_t)(st.pos >> 8);
-			out[5] = (uint8_t)(st.pos >> 16);
-			out[6] = (uint8_t)(st.pos >> 24);
-			out[7] = (uint8_t)st.offset_mrad;
-			out[8] = (uint8_t)(st.offset_mrad >> 8);
-			out[9] = (uint8_t)(st.offset_mrad >> 16);
-			out[10] = (uint8_t)(st.offset_mrad >> 24);
-			out[11] = (uint8_t)(motor_get_spring_k() * 10.f);
-			hid_send(out, bufsize);
-			return;
-		}
-		case HID_CMD_SET_K:
+		case TK_CMD_START:
+			motor_start();
+			return 1;
+		case TK_CMD_STOP:
+			motor_cmd_stop();
+			return 1;
+		case TK_CMD_SPRING:
+			return motor_cmd_spring() ? 1 : 0;
+		case TK_CMD_SPIN:
+			return motor_cmd_spin() ? 1 : 0;
+		case TK_CMD_TEST:
+			return motor_cmd_test() ? 1 : 0;
+		case TK_CMD_SET_K:
 			if(bufsize >= 2)
 				motor_set_spring_k((float)buffer[1] / 10.f);
-			out[0] = HID_CMD_SET_K;
-			hid_send(out, bufsize);
-			return;
-		case HID_CMD_SET_REST:
+			return 1;
+		case TK_CMD_SET_REST:
 			motor_set_rest_to_current();
-			out[0] = HID_CMD_SET_REST;
-			hid_send(out, bufsize);
-			return;
-		default: {
-			for(uint16_t i = 0; i < bufsize; i++)
-				out[i] = buffer[i] + 1;
-			hid_send(out, bufsize);
-			return;
-		}
+			return 1;
+		default:
+			return -1;
 	}
 }
 
@@ -210,7 +217,6 @@ void serial_receive(uint8_t const* buffer, uint16_t bufsize) {
 }
 
 #include "hardware/xosc.h"
-extern void cdc_task(void);
 int main() {
 	xosc_init();
 
@@ -226,11 +232,13 @@ int main() {
 	add_repeating_timer_us(249978ul, timer_4hz_callback, NULL, &timer);
 	tusb_init();
 	cdc_log_init();
-	LOG_RAW("idle: START SPRING SPIN TEST STOP DUMP + newline\n");
+	LOG_RAW("boot: auto START; Bulk Vendor + CDC SPRING SPIN TEST STOP DUMP UPLOAD\n");
+	motor_start();
 	while(true) {
 		app_sched_execute();
 		tud_task();
 		cdc_task();
+		vendor_task();
 		__wfi();
 	}
 }

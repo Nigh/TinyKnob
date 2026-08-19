@@ -1,13 +1,19 @@
 #include "tusb.h"
 #include "tusb_config.h"
 #include "hardware/sync.h"
+#include "pico/time.h"
 
 #include "string.h"
+#include "motor.h"
+#include "usb_func.h"
 
 volatile bool usb_mounted = false;
 
 void serial_receive(uint8_t const* buffer, uint16_t bufsize);
-void hid_receive(uint8_t const* buffer, uint16_t bufsize);
+
+#define TELEM_MAGIC 0xA5
+#define ACK_MAGIC 0x5A
+#define TELEM_PERIOD_US 1000u /* ~1 kHz */
 
 //--------------------------------------------------------------------+
 // CDC log ring — enqueue from any context; drain only from main loop
@@ -136,37 +142,81 @@ void tud_resume_cb(void) {
 }
 
 //--------------------------------------------------------------------+
-// USB HID
+// Vendor Bulk — commands OUT, telemetry IN (see docs/usb-protocol.md)
 //--------------------------------------------------------------------+
-
-uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t* buffer, uint16_t reqlen) {
-	(void)itf;
-	(void)report_id;
-	(void)report_type;
-	(void)buffer;
-	(void)reqlen;
-	return 0;
-}
 
 __attribute__((weak)) void serial_receive(uint8_t const* buffer, uint16_t bufsize) {
 	(void)buffer;
 	(void)bufsize;
 }
 
-__attribute__((weak)) void hid_receive(uint8_t const* buffer, uint16_t bufsize) {
+__attribute__((weak)) int vendor_cmd(uint8_t const* buffer, uint16_t bufsize) {
 	(void)buffer;
 	(void)bufsize;
+	return -1;
 }
 
-void hid_send(uint8_t const* buffer, uint16_t bufsize) {
-	if(!usb_mounted)
+static void vendor_send_ack(uint8_t cmd, uint8_t status) {
+	if(!usb_mounted || !tud_vendor_n_mounted(0))
 		return;
-	tud_hid_report(0, buffer, bufsize);
+	if(tud_vendor_n_write_available(0) < 3)
+		return;
+	uint8_t ack[3] = {ACK_MAGIC, cmd, status};
+	tud_vendor_n_write(0, ack, 3);
+	tud_vendor_n_write_flush(0);
 }
 
-void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t const* buffer, uint16_t bufsize) {
-	(void)itf;
-	(void)report_id;
-	(void)report_type;
-	hid_receive(buffer, bufsize);
+static void vendor_send_telem(void) {
+	if(!usb_mounted || !tud_vendor_n_mounted(0))
+		return;
+	if(tud_vendor_n_write_available(0) < 16)
+		return;
+
+	static uint16_t seq;
+	motor_state_t st;
+	motor_get_state(&st);
+
+	uint8_t pkt[16];
+	pkt[0] = TELEM_MAGIC;
+	pkt[1] = st.mode;
+	pkt[2] = (uint8_t)st.angle_mrad;
+	pkt[3] = (uint8_t)(st.angle_mrad >> 8);
+	pkt[4] = (uint8_t)(st.angle_mrad >> 16);
+	pkt[5] = (uint8_t)(st.angle_mrad >> 24);
+	pkt[6] = (uint8_t)st.duty_a_q15;
+	pkt[7] = (uint8_t)(st.duty_a_q15 >> 8);
+	pkt[8] = (uint8_t)st.duty_b_q15;
+	pkt[9] = (uint8_t)(st.duty_b_q15 >> 8);
+	pkt[10] = (uint8_t)st.duty_c_q15;
+	pkt[11] = (uint8_t)(st.duty_c_q15 >> 8);
+	pkt[12] = (uint8_t)seq;
+	pkt[13] = (uint8_t)(seq >> 8);
+	pkt[14] = 0;
+	pkt[15] = 0;
+	seq++;
+
+	tud_vendor_n_write(0, pkt, 16);
+	tud_vendor_n_write_flush(0);
+}
+
+void vendor_task(void) {
+	if(!usb_mounted || !tud_vendor_n_mounted(0))
+		return;
+
+	while(tud_vendor_n_available(0)) {
+		uint8_t buf[64];
+		uint32_t n = tud_vendor_n_read(0, buf, sizeof(buf));
+		if(n == 0)
+			break;
+		int rc = vendor_cmd(buf, (uint16_t)n);
+		if(rc >= 0)
+			vendor_send_ack(buf[0], (uint8_t)rc);
+	}
+
+	static uint32_t last_us;
+	uint32_t now = time_us_32();
+	if((uint32_t)(now - last_us) >= TELEM_PERIOD_US) {
+		last_us = now;
+		vendor_send_telem();
+	}
 }

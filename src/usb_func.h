@@ -9,6 +9,8 @@ void cdc_task(void);
 void cdc_log_enqueue(const void* data, uint16_t len);
 void cdc_log_print(char* str);
 void cdc_log_print_wait(char* str);
-void hid_send(uint8_t const* buffer, uint16_t bufsize);
+void vendor_task(void);
+/* Return 1=ok, 0=rejected, -1=unknown (no ACK). */
+int vendor_cmd(uint8_t const* buffer, uint16_t bufsize);
 
 #endif

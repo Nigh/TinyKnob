@@ -33,11 +33,14 @@
  */
 #define _PID_MAP(itf, n) ((CFG_TUD_##itf) << (n))
 
-// In THIS example, PID = 0x4005
+// CDC | VENDOR → PID = 0x4011
 #define USB_PID (0x4000 | _PID_MAP(CDC, 0) | _PID_MAP(MSC, 1) | _PID_MAP(HID, 2) | _PID_MAP(MIDI, 3) | _PID_MAP(VENDOR, 4))
 
 #define USB_VID 0xACDC
 #define USB_BCD 0x0200
+#if USB_PID != 0x4011
+	#error USB_PID must be 0x4011 (CDC+VENDOR); keep docs/usb-protocol.md in sync
+#endif
 
 //--------------------------------------------------------------------+
 // Device Descriptors
@@ -73,31 +76,17 @@ uint8_t const* tud_descriptor_device_cb(void) {
 }
 
 //--------------------------------------------------------------------+
-// HID Report Descriptor
-//--------------------------------------------------------------------+
-uint8_t const desc_hid_report[] = {
-	TUD_HID_REPORT_DESC_GENERIC_INOUT(CFG_TUD_HID_EP_BUFSIZE)
-};
-
-// Invoked when received GET HID REPORT DESCRIPTOR
-// Application return pointer to descriptor
-// Descriptor contents must exist long enough for transfer to complete
-uint8_t const* tud_hid_descriptor_report_cb(uint8_t itf) {
-	(void)itf;
-	return desc_hid_report;
-}
-
-//--------------------------------------------------------------------+
 // Configuration Descriptor
 //--------------------------------------------------------------------+
 enum {
-	ITF_NUM_HID = 0,
-	ITF_NUM_CDC_0,
+	ITF_NUM_CDC_0 = 0,
 	ITF_NUM_CDC_0_DATA,
+	ITF_NUM_VENDOR,
 	ITF_NUM_TOTAL
 };
-#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + CFG_TUD_CDC * TUD_CDC_DESC_LEN + TUD_HID_INOUT_DESC_LEN)
-#define EPNUM_HID 0x01
+#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + CFG_TUD_CDC * TUD_CDC_DESC_LEN + CFG_TUD_VENDOR * TUD_VENDOR_DESC_LEN)
+#define EPNUM_VENDOR_OUT 0x01
+#define EPNUM_VENDOR_IN 0x81
 #define EPNUM_CDC_0_NOTIF 0x84
 #define EPNUM_CDC_0_OUT 0x04
 #define EPNUM_CDC_0_IN 0x85
@@ -107,16 +96,14 @@ uint8_t const desc_fs_configuration[] = {
 	// power in mA
 	TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 200),
 
-	// Interface number, string index, protocol, report descriptor len, EP Out & In address, size & polling interval
-	TUD_HID_INOUT_DESCRIPTOR(ITF_NUM_HID, 0,
-							 HID_ITF_PROTOCOL_NONE, sizeof(desc_hid_report),
-							 EPNUM_HID, 0x80 | EPNUM_HID,
-							 CFG_TUD_HID_EP_BUFSIZE, 5),
-	// 1st CDC: Interface number, string index, EP notification address and
+	// CDC: Interface number, string index, EP notification address and
 	// size, EP data address (out, in) and size.
 	TUD_CDC_DESCRIPTOR(ITF_NUM_CDC_0, 4,
 					   EPNUM_CDC_0_NOTIF, 8,
-					   EPNUM_CDC_0_OUT, EPNUM_CDC_0_IN, 64)
+					   EPNUM_CDC_0_OUT, EPNUM_CDC_0_IN, 64),
+
+	// Vendor Bulk OUT/IN (was HID endpoints 0x01/0x81)
+	TUD_VENDOR_DESCRIPTOR(ITF_NUM_VENDOR, 5, EPNUM_VENDOR_OUT, EPNUM_VENDOR_IN, 64)
 };
 
 // Invoked when received GET CONFIGURATION DESCRIPTOR
@@ -147,6 +134,7 @@ char const* string_desc_arr[] = {
 	"VBTT Device", // 2: Product
 	"000001", // 3: Serials, should use chip ID
 	"VBTT CDC", // 4: CDC Interface
+	"VBTT Vendor", // 5: Vendor Bulk Interface
 };
 
 static uint16_t _desc_str[32 + 1];

@@ -2,8 +2,10 @@
 
 RP2040-Zero + DRV8316 + MT6701 force-feedback knob.
 
-`PID=0x4005`
+`PID=0x4011`
 `VID=0xACDC`
+
+USB binary protocol (Vendor Bulk telemetry + commands): see [docs/usb-protocol.md](docs/usb-protocol.md).
 
 ## Wiring
 
@@ -49,23 +51,32 @@ make rebuild
 
 ## Usage
 
-On power-up the firmware stays idle with INHx held low (no PWM switching; low quiescent power). CDC `START` + newline runs align, then waits. Switch feel with `SPRING` / `SPIN` / `TEST` / `STOP`. Continuous SSI CRC failures trip FAULT and return to the same low-side brake idle. True phase Hi-Z needs INLx wired later.
+On power-up the firmware runs align automatically (`START`), then returns to IDLE (armed, green LED). Switch feel with `SPRING` / `SPIN` / `TEST` / `STOP`. Continuous SSI CRC failures trip FAULT (red LED) and return to low-side brake idle. True phase Hi-Z needs INLx wired later.
 
-USB enumerates CDC (logs) and HID. HID report byte 0:
+LED (WS2812): orange blink = aligning; green = idle; blue = spring; cyan = spin; white blink = TEST; red = fault; purple = UPLOAD (before bootrom).
 
-- `0x10` get state (mode, dir, pos, offset, K)
-- `0x20` set spring K, byte 1 = K * 10
-- `0x21` set rest to current angle
-- anything else: echo with each byte incremented by 1 (ping)
+USB enumerates CDC (logs) and a Vendor Bulk interface. Hosts should use Vendor Bulk for realtime telemetry and mode commands; full layout is in [docs/usb-protocol.md](docs/usb-protocol.md).
 
-CDC commands (line ending `\n` or `\r`):
+Vendor Bulk OUT opcodes:
 
-- `START` align, then idle (armed)
-- `SPRING` virtual spring at current angle (needs START)
-- `SPIN` voltage-mode flywheel (needs START). Under-compensates BEMF so it will not
+- `0x01` START (align)
+- `0x02` STOP
+- `0x03` SPRING
+- `0x04` SPIN
+- `0x05` TEST
+- `0x20` SET_K, byte 1 = K * 10
+- `0x21` SET_REST to current angle
+
+Bulk IN pushes 16-byte frames (~1 kHz): magic `0xA5`, mode, angle_mrad, phase duties Q15, seq.
+
+CDC commands (line ending `\n` or `\r`) remain for debug:
+
+- `START` re-run align, then idle (armed); also runs once at boot
+- `SPRING` virtual spring at current angle (needs align)
+- `SPIN` voltage-mode flywheel (needs align). Under-compensates BEMF so it will not
   self-spin; feel is draggy until an `Iq` current loop can hold `Iq≈0` (needs CSA/CSB/CSC).
   `Uq=0` is low-side brake (no INLx Hi-Z yet).
-- `TEST` loop ±360° with 5th-order ease (~1.4s move + ≤200ms hold) (needs START)
+- `TEST` loop ±360° with 5th-order ease (~1.4s move + ≤200ms hold) (needs align)
 - `STOP` brake / idle, keep align
 - `DUMP` print one full SSI frame (bits + shift candidates), waits on CDC so lines are complete
 - `UPLOAD` reboot to UF2 bootloader

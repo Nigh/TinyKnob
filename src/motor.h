@@ -19,8 +19,12 @@ enum {
 typedef struct {
 	uint8_t mode;
 	int32_t pos;
+	int32_t angle_mrad;
 	int32_t offset_mrad;
 	int8_t dir;
+	int16_t duty_a_q15;
+	int16_t duty_b_q15;
+	int16_t duty_c_q15;
 	uint32_t crc_fail;
 	uint32_t crc_ok;
 	uint32_t raw;

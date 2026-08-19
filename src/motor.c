@@ -58,6 +58,9 @@ static float ud_cmd;
 static float uq_cmd;
 static float forced_te;
 static bool te_from_encoder;
+static volatile float duty_a_cached;
+static volatile float duty_b_cached;
+static volatile float duty_c_cached;
 static bool enc_ok_this;
 
 static uint32_t ms_to_ticks(uint32_t ms) {
@@ -157,6 +160,9 @@ static uint16_t duty_to_level(float d) {
 }
 
 void motor_set_duty(float a, float b, float c) {
+	duty_a_cached = a;
+	duty_b_cached = b;
+	duty_c_cached = c;
 	pwm_set_gpio_level(PIN_PWM_A, duty_to_level(a));
 	pwm_set_gpio_level(PIN_PWM_B, duty_to_level(b));
 	pwm_set_gpio_level(PIN_PWM_C, duty_to_level(c));
@@ -174,8 +180,12 @@ static void motor_brake_low(void) {
 void motor_get_state(motor_state_t* s) {
 	s->mode = mode;
 	s->pos = pos;
+	s->angle_mrad = (int32_t)((float)pos * RAD_PER_COUNT * 1000.f);
 	s->offset_mrad = (int32_t)(offset_rad * 1000.f);
 	s->dir = dir;
+	s->duty_a_q15 = (int16_t)(duty_a_cached * 32767.f);
+	s->duty_b_q15 = (int16_t)(duty_b_cached * 32767.f);
+	s->duty_c_q15 = (int16_t)(duty_c_cached * 32767.f);
 	s->crc_fail = crc_fail;
 	s->crc_ok = crc_ok;
 	s->raw = last_raw;

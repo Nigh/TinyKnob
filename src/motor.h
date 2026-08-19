@@ -14,6 +14,7 @@ enum {
 	MOTOR_SPRING,
 	MOTOR_SPIN, // voltage-mode only; true freewheel needs Iq current loop
 	MOTOR_FAULT,
+	MOTOR_POS, // track absolute angle_mrad (streaming setpoint)
 };
 
 typedef struct {
@@ -38,6 +39,7 @@ void motor_cmd_stop(void);
 bool motor_cmd_spring(void);
 bool motor_cmd_spin(void); // provisional flywheel; needs Iq loop for low-drag coast
 bool motor_cmd_test(void);
+bool motor_cmd_goto(int32_t angle_mrad); // set/track absolute mech angle (telem units)
 void motor_set_duty(float a, float b, float c);
 void motor_get_state(motor_state_t* s);
 void motor_set_spring_k(float k);

@@ -2,6 +2,7 @@
 #include "pico/stdlib.h"
 #include "hardware/sync.h"
 #include <string.h>
+#include <stdlib.h>
 
 #include "scheduler/uevent.h"
 #include "scheduler/scheduler.h"
@@ -37,8 +38,8 @@ bool timer_4hz_callback(struct repeating_timer* t) {
 
 #define U32RGB(r, g, b) (((uint32_t)(r) << 8) | ((uint32_t)(g) << 16) | (uint32_t)(b))
 
-// LED: align=orange blink, idle=green, spring=blue, spin=cyan, test=white blink, fault=red.
-// UPLOAD purple is set in serial_handle_line before bootrom.
+// LED: align=orange blink, idle=green, spring=blue, spin=cyan, test=white blink,
+	// pos=yellow (tracking), fault=red. UPLOAD purple is set in serial_handle_line before bootrom.
 static void led_status(void) {
 	static uint8_t tick;
 	motor_state_t st;
@@ -56,6 +57,10 @@ static void led_status(void) {
 	}
 	if(st.mode == MOTOR_TEST) {
 		ws2812_setpixel(on ? U32RGB(24, 24, 24) : U32RGB(0, 0, 0));
+		return;
+	}
+	if(st.mode == MOTOR_POS) {
+		ws2812_setpixel(U32RGB(28, 22, 0));
 		return;
 	}
 	if(st.mode == MOTOR_SPRING) {
@@ -79,9 +84,9 @@ void main_handler(uevt_t* evt) {
 				motor_state_t st;
 				motor_get_state(&st);
 				tick++;
-				// 4 Hz during align and TEST; else ~1 Hz
+				// 4 Hz during align, TEST, POS; else ~1 Hz
 				bool fast = (st.mode >= MOTOR_ALIGN_RAMP && st.mode <= MOTOR_ALIGN_DOWN) ||
-						st.mode == MOTOR_TEST;
+						st.mode == MOTOR_TEST || st.mode == MOTOR_POS;
 				if(fast || (tick & 3) == 0) {
 					LOG_RAW("m%u p%ld o%lu f%lu d%d\n",
 							st.mode, (long)st.pos,
@@ -106,6 +111,7 @@ enum {
 	TK_CMD_SPRING = 0x03,
 	TK_CMD_SPIN = 0x04,
 	TK_CMD_TEST = 0x05,
+	TK_CMD_GOTO = 0x06,
 	TK_CMD_SET_K = 0x20,
 	TK_CMD_SET_REST = 0x21,
 };
@@ -114,14 +120,17 @@ int vendor_cmd(uint8_t const* buffer, uint16_t bufsize) {
 	if(bufsize < 1)
 		return -1;
 
-	char str[16 * 2 + 1];
-	uint16_t dump_n = bufsize < 16 ? bufsize : 16;
-	for(uint16_t i = 0; i < dump_n; i++) {
-		str[i * 2] = printHex[buffer[i] >> 4];
-		str[i * 2 + 1] = printHex[buffer[i] & 0xF];
+	// ponytail: GOTO is high-rate; skip hex dump so CDC keeps up.
+	if(buffer[0] != TK_CMD_GOTO) {
+		char str[16 * 2 + 1];
+		uint16_t dump_n = bufsize < 16 ? bufsize : 16;
+		for(uint16_t i = 0; i < dump_n; i++) {
+			str[i * 2] = printHex[buffer[i] >> 4];
+			str[i * 2 + 1] = printHex[buffer[i] & 0xF];
+		}
+		str[dump_n * 2] = 0;
+		LOG_RAW("VND[%d]:%s\n", bufsize, str);
 	}
-	str[dump_n * 2] = 0;
-	LOG_RAW("VND[%d]:%s\n", bufsize, str);
 
 	switch(buffer[0]) {
 		case TK_CMD_START:
@@ -136,6 +145,13 @@ int vendor_cmd(uint8_t const* buffer, uint16_t bufsize) {
 			return motor_cmd_spin() ? 1 : 0;
 		case TK_CMD_TEST:
 			return motor_cmd_test() ? 1 : 0;
+		case TK_CMD_GOTO: {
+			if(bufsize < 5)
+				return 0;
+			int32_t angle_mrad = (int32_t)((uint32_t)buffer[1] | ((uint32_t)buffer[2] << 8) |
+					((uint32_t)buffer[3] << 16) | ((uint32_t)buffer[4] << 24));
+			return motor_cmd_goto(angle_mrad) ? 1 : 0;
+		}
 		case TK_CMD_SET_K:
 			if(bufsize >= 2)
 				motor_set_spring_k((float)buffer[1] / 10.f);
@@ -181,6 +197,20 @@ static void serial_handle_line(const char* line) {
 	if(strcmp(line, "TEST") == 0) {
 		if(motor_cmd_test()) {
 			LOG_RAW("TEST\n");
+		} else {
+			LOG_RAW("need START\n");
+		}
+		return;
+	}
+	if(strncmp(line, "GOTO ", 5) == 0) {
+		char* end = NULL;
+		long v = strtol(line + 5, &end, 10);
+		if(end == line + 5) {
+			LOG_RAW("GOTO need mrad\n");
+			return;
+		}
+		if(motor_cmd_goto((int32_t)v)) {
+			LOG_RAW("GOTO %ld\n", v);
 		} else {
 			LOG_RAW("need START\n");
 		}
@@ -232,7 +262,7 @@ int main() {
 	add_repeating_timer_us(249978ul, timer_4hz_callback, NULL, &timer);
 	tusb_init();
 	cdc_log_init();
-	LOG_RAW("boot: auto START; Bulk Vendor + CDC SPRING SPIN TEST STOP DUMP UPLOAD\n");
+	LOG_RAW("boot: auto START; Bulk Vendor + CDC SPRING SPIN TEST GOTO STOP DUMP UPLOAD\n");
 	motor_start();
 	while(true) {
 		app_sched_execute();

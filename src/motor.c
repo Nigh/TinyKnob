@@ -61,6 +61,7 @@ static bool te_from_encoder;
 static volatile float duty_a_cached;
 static volatile float duty_b_cached;
 static volatile float duty_c_cached;
+static volatile int32_t track_pos;
 static bool enc_ok_this;
 
 static uint32_t ms_to_ticks(uint32_t ms) {
@@ -462,6 +463,16 @@ static void motor_isr(void) {
 				start_move(test_fwd ? home_pos + COUNTS_PER_REV : home_pos, MOTOR_TEST);
 			}
 			break;
+		case MOTOR_POS: {
+			// ponytail: P+D toward track_pos each PWM tick. Ceiling: lag on fast sim;
+			// upgrade = host ω feedforward in the GOTO payload.
+			float err = (float)(track_pos - pos) * RAD_PER_COUNT;
+			float vel = vel_update(SPRING_VEL_ALPHA);
+			ud_cmd = 0.f;
+			uq_cmd = clampf(err * POS_KP - SPRING_D * vel, -TEST_UQ_MAX, TEST_UQ_MAX);
+			te_from_encoder = true;
+			break;
+		}
 		case MOTOR_SPRING: {
 			float vel = vel_update(SPRING_VEL_ALPHA);
 			ud_cmd = 0.f;
@@ -547,6 +558,31 @@ bool motor_cmd_test(void) {
 	return true;
 }
 
+bool motor_cmd_goto(int32_t angle_mrad) {
+	if(!aligned || mode == MOTOR_FAULT || is_aligning())
+		return false;
+	int32_t target = (int32_t)((float)angle_mrad / (RAD_PER_COUNT * 1000.f));
+	irq_set_enabled(PWM_IRQ_WRAP, false);
+	track_pos = target;
+	if(mode != MOTOR_POS) {
+		pos_last = pos;
+		vel_filt = 0.f;
+		enter_mode(MOTOR_POS);
+	}
+	irq_set_enabled(PWM_IRQ_WRAP, true);
+	return true;
+}
+
+static bool pos_selfcheck(void) {
+	// One mech rev ↔ mrad ↔ counts (telemetry units).
+	int32_t mrad = (int32_t)((float)COUNTS_PER_REV * RAD_PER_COUNT * 1000.f);
+	int32_t back = (int32_t)((float)mrad / (RAD_PER_COUNT * 1000.f));
+	int32_t err = back - (int32_t)COUNTS_PER_REV;
+	if(err < 0)
+		err = -err;
+	return err <= 2;
+}
+
 void motor_setup(void) {
 	// ponytail: 1024-pt sin LUT (~4KB); cos = lut[i+N/4]. Ceiling: ~0.35°; upgrade = lerp.
 	for(uint32_t i = 0; i < SIN_LUT_N; i++)
@@ -555,6 +591,8 @@ void motor_setup(void) {
 		LOG_RAW("spring selfcheck FAIL\n");
 	if(!spin_selfcheck())
 		LOG_RAW("spin selfcheck FAIL\n");
+	if(!pos_selfcheck())
+		LOG_RAW("pos selfcheck FAIL\n");
 
 	gpio_init(PIN_DRV_EN);
 	gpio_set_dir(PIN_DRV_EN, GPIO_OUT);

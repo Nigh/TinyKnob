@@ -78,6 +78,7 @@ Total size: **16 bytes**.
 | 6 | `MOTOR_SPRING` | Virtual spring |
 | 7 | `MOTOR_SPIN` | Voltage-mode flywheel |
 | 8 | `MOTOR_FAULT` | Fault (CRC etc.); brake |
+| 9 | `MOTOR_POS` | Track absolute angle (streaming setpoint) |
 
 ## Command frames (host → device, Bulk OUT)
 
@@ -90,8 +91,18 @@ Each command is one Bulk OUT transfer. Byte 0 is the opcode; payload follows imm
 | `0x03` | `SPRING` | none | Enter spring (needs prior align) |
 | `0x04` | `SPIN` | none | Enter spin (needs prior align) |
 | `0x05` | `TEST` | none | Enter TEST (needs prior align) |
+| `0x06` | `GOTO` | `i32 angle_mrad` (LE) | Enter/stay in `MOTOR_POS` and set tracking target (needs prior align) |
 | `0x20` | `SET_K` | `u8 k_x10` | Spring stiffness `K = k_x10 / 10` (clamped 0…8) |
 | `0x21` | `SET_REST` | none | Set spring rest angle to current position |
+
+### GOTO / tracking details
+
+- Payload uses the same unit as telemetry `angle_mrad` (unwrapped mechanical milliradians).
+- Example: `+π` rad ≈ `3142` mrad → bytes `06 4E 0C 00 00` (`0x06` + LE `0x00000C4E`).
+- **Tracking mode** (not a timed trajectory): each PWM tick (~20 kHz) applies P+D toward the latest target. Safe to stream at **hundreds of Hz to ~1 kHz** from the host to follow a simulated wheel.
+- First accepted `GOTO` enters `MOTOR_POS`; later `GOTO`s only update the setpoint (no mode restart).
+- Exit with `STOP` or another mode command (`SPRING` / `SPIN` / `TEST` / `START`).
+- Successful `GOTO` does **not** emit an ACK (keeps Bulk IN free for telemetry). Rejected `GOTO` still ACKs with `status=0`. Watch telem `mode == 9` to confirm tracking.
 
 ### Short ACK (optional)
 
@@ -101,20 +112,24 @@ After a command, the device may write a 3-byte packet on Bulk IN:
 |--------|------|---------|
 | 0 | `u8` | magic `0x5A` |
 | 1 | `u8` | echoed `cmd` |
-| 2 | `u8` | `status`: `1` = ok, `0` = rejected (e.g. SPRING/SPIN/TEST before align) |
+| 2 | `u8` | `status`: `1` = ok, `0` = rejected (e.g. SPRING/SPIN/TEST/GOTO before align, or `GOTO` with short payload) |
 
 Hosts **may ignore** ACKs. Distinguish from telemetry by `magic`: `0xA5` = telem, `0x5A` = ack. If a read returns a length other than 16, or magic is `0x5A`, treat as ack (or skip).
+
+Exception: successful `GOTO` (`0x06`, `status` would be 1) sends **no** ACK.
 
 ### Failure semantics
 
 - `START` / `STOP` / `SET_K` / `SET_REST` always succeed at the protocol layer (`status=1`).
-- `SPRING` / `SPIN` / `TEST` return `status=0` if the motor is not aligned/armed yet (same as CDC `need START`).
+- `SPRING` / `SPIN` / `TEST` / `GOTO` return `status=0` if the motor is not aligned/armed yet (same as CDC `need START`), or if `GOTO` payload is fewer than 4 bytes. Successful `GOTO` skips ACK entirely.
 - Unknown `cmd`: no ACK; ignored.
 - Empty OUT transfer: ignored.
 
 ## CDC side channel (debug only)
 
-CDC remains for logs. Text lines ending in `\n` or `\r` still accept: `START`, `STOP`, `SPRING`, `SPIN`, `TEST`, `DUMP`, `UPLOAD`. Binary hosts should use Vendor Bulk only.
+CDC remains for logs. Text lines ending in `\n` or `\r` still accept: `START`, `STOP`, `SPRING`, `SPIN`, `TEST`, `GOTO <mrad>`, `DUMP`, `UPLOAD`. Binary hosts should use Vendor Bulk only.
+
+Example: stream `GOTO 3142` (or Bulk `0x06` + LE int32) at your sim rate to track about +π rad absolute.
 
 ## Host sketch (Python + pyusb)
 
@@ -151,12 +166,16 @@ def read_telem():
     }
 
 send_cmd(0x01)           # START
-send_cmd(0x03)           # SPRING
-send_cmd(0x20, 25)       # SET_K → 2.5
+# Stream tracking setpoints (sim wheel). No ACK on success.
+def goto_mrad(mrad: int) -> None:
+    dev.write(EP_OUT, struct.pack("<Bi", 0x06, mrad), timeout=1000)
+
+goto_mrad(3142)          # ~+π rad
 while True:
     frame = read_telem()
-    if frame and frame != ("ack",) and isinstance(frame, dict):
+    if isinstance(frame, dict):
         print(frame)
+        # optionally: goto_mrad(sim_angle_mrad)
 ```
 
 ## C struct (device / host)
@@ -192,6 +211,7 @@ enum {
 	TK_CMD_SPRING   = 0x03,
 	TK_CMD_SPIN     = 0x04,
 	TK_CMD_TEST     = 0x05,
+	TK_CMD_GOTO     = 0x06,
 	TK_CMD_SET_K    = 0x20,
 	TK_CMD_SET_REST = 0x21,
 };

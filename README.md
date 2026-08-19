@@ -51,9 +51,9 @@ make rebuild
 
 ## Usage
 
-On power-up the firmware runs align automatically (`START`), then returns to IDLE (armed, green LED). Switch feel with `SPRING` / `SPIN` / `TEST` / `STOP`. Continuous SSI CRC failures trip FAULT (red LED) and return to idle at 50% zero-voltage PWM. True phase Hi-Z needs INLx wired later.
+On power-up the firmware runs align automatically (`START`), then returns to IDLE (armed, green LED). Switch feel with `SPRING` / `SPIN` / `TEST` / `GOTO` / `STOP`. Continuous SSI CRC failures trip FAULT (red LED) and return to idle at 50% zero-voltage PWM. True phase Hi-Z needs INLx wired later.
 
-LED (WS2812): orange blink = aligning; green = idle; blue = spring; cyan = spin; white blink = TEST; red = fault; purple = UPLOAD (before bootrom).
+LED (WS2812): orange blink = aligning; green = idle; blue = spring; cyan = spin; white blink = TEST; yellow = POS; red = fault; purple = UPLOAD (before bootrom).
 
 USB enumerates CDC (logs) and a Vendor Bulk interface. Hosts should use Vendor Bulk for realtime telemetry and mode commands; full layout is in [docs/usb-protocol.md](docs/usb-protocol.md).
 
@@ -64,6 +64,7 @@ Vendor Bulk OUT opcodes:
 - `0x03` SPRING
 - `0x04` SPIN
 - `0x05` TEST
+- `0x06` GOTO, next 4 bytes = absolute `angle_mrad` (LE int32); tracking setpoint (streamable)
 - `0x20` SET_K, byte 1 = K * 10
 - `0x21` SET_REST to current angle
 
@@ -77,8 +78,9 @@ CDC commands (line ending `\n` or `\r`) remain for debug:
   self-spin; feel is draggy until an `Iq` current loop can hold `Iq≈0` (needs CSA/CSB/CSC).
   `Uq=0` / idle use 50% zero-voltage PWM (no INLx Hi-Z yet).
 - `TEST` loop ±360° with 5th-order ease (~1.4s move + ≤200ms hold) (needs align)
+- `GOTO <mrad>` enter tracking mode / update absolute setpoint in milliradians (needs align)
 - `STOP` brake / idle, keep align
 - `DUMP` print one full SSI frame (bits + shift candidates), waits on CDC so lines are complete
 - `UPLOAD` reboot to UF2 bootloader
 
-Periodic status (~1 Hz, or 4 Hz during align/TEST) is a short `m/p/o/f` line plus one `ssi` brief line. CDC TX uses a 1 KB ring drained in the main loop; the 4 Hz timer IRQ never writes USB.
+Periodic status (~1 Hz, or 4 Hz during align/TEST/POS) is a short `m/p/o/f` line plus one `ssi` brief line. CDC TX uses a 1 KB ring drained in the main loop; the 4 Hz timer IRQ never writes USB.

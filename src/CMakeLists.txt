@@ -23,6 +23,7 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
 	hardware_sync
 	hardware_pio
 	hardware_pwm
+	hardware_adc
 	hardware_clocks
 	hardware_dma
 	hardware_irq

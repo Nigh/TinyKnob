@@ -12,7 +12,7 @@ enum {
 	MOTOR_ALIGN_DOWN,
 	MOTOR_TEST,
 	MOTOR_SPRING,
-	MOTOR_SPIN, // voltage-mode only; true freewheel needs Iq current loop
+	MOTOR_SPIN, // voltage flywheel (even if CUR_LOOP_CTRL; PI+TE_OFF mix cogging)
 	MOTOR_FAULT,
 	MOTOR_POS, // track absolute angle_mrad (streaming setpoint)
 	MOTOR_STRESS, // full-speed fwd/rev burn-in with smooth Uq ramps
@@ -32,13 +32,19 @@ typedef struct {
 	uint32_t raw;
 	uint32_t pio_word;
 	bool last_crc_ok;
+	float id_a;
+	float iq_a;
+	float iq_ref_a;
+	float vbus_v;
+	float ud_out;
+	float uq_out;
 } motor_state_t;
 
 void motor_setup(void);
 void motor_start(void);
 void motor_cmd_stop(void);
 bool motor_cmd_spring(void);
-bool motor_cmd_spin(void); // provisional flywheel; needs Iq loop for low-drag coast
+bool motor_cmd_spin(void);
 bool motor_cmd_test(void);
 bool motor_cmd_stress(void);
 bool motor_cmd_goto(int32_t angle_mrad); // set/track absolute mech angle (telem units)

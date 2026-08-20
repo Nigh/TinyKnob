@@ -82,11 +82,12 @@ Total size: **24 bytes**. Bytes 0–13 match the previous 16-byte frame prefix (
 | 3 | `MOTOR_DIR_PULSE` | Direction sense pulse |
 | 4 | `MOTOR_ALIGN_DOWN` | Align ramp down |
 | 5 | `MOTOR_TEST` | ±360° test move |
-| 6 | `MOTOR_SPRING` | Virtual spring |
+| 6 | `MOTOR_SPRING` | Virtual spring inside ±π; hard wall beyond ±π (no wrap-through) |
 | 7 | `MOTOR_SPIN` | Flywheel (`CUR_LOOP_EN`: voltage or Iq≈0) |
 | 8 | `MOTOR_FAULT` | Fault (CRC etc.); brake |
 | 9 | `MOTOR_POS` | Track absolute angle (streaming setpoint) |
 | 10 | `MOTOR_STRESS` | Burn-in: +full / stop / −full / stop with smooth Uq ramps |
+| 11 | `MOTOR_COG_CAL` | Slow +1 mech rev; learn cogging LUT then IDLE |
 
 ## Command frames (host → device, Bulk OUT)
 
@@ -101,6 +102,8 @@ Each command is one Bulk OUT transfer. Byte 0 is the opcode; payload follows imm
 | `0x05` | `TEST` | none | Enter TEST (needs prior align) |
 | `0x06` | `GOTO` | `i32 angle_mrad` (LE) | Enter/stay in `MOTOR_POS` and set tracking target (needs prior align) |
 | `0x07` | `STRESS` | none | Enter burn-in loop (needs prior align): +full 3s, stop 1s, −full 3s, stop 1s; 500ms smoothstep Uq on start/stop |
+| `0x08` | `COG_CAL` | none | Slow +1 rev position track; fill cogging FF LUT (needs prior align). ~`COG_CAL_MS` then IDLE with FF on |
+| `0x09` | `COG_CLEAR` | none | Disable cogging FF and zero the LUT |
 | `0x20` | `SET_K` | `u8 k_x10` | Spring stiffness `K = k_x10 / 10` (clamped 0…8) |
 | `0x21` | `SET_REST` | none | Set spring rest angle to current position |
 | `0x7F` | `UPLOAD` | none | Reboot into UF2 bootloader (same as CDC `UPLOAD`) |
@@ -111,7 +114,7 @@ Each command is one Bulk OUT transfer. Byte 0 is the opcode; payload follows imm
 - Example: `+π` rad ≈ `3142` mrad → bytes `06 4E 0C 00 00` (`0x06` + LE `0x00000C4E`).
 - **Tracking mode** (not a timed trajectory): each PWM tick (~20 kHz) applies P+D toward the latest target. Safe to stream at **hundreds of Hz to ~1 kHz** from the host to follow a simulated wheel.
 - First accepted `GOTO` enters `MOTOR_POS`; later `GOTO`s only update the setpoint (no mode restart).
-- Exit with `STOP` or another mode command (`SPRING` / `SPIN` / `TEST` / `STRESS` / `START`).
+- Exit with `STOP` or another mode command (`SPRING` / `SPIN` / `TEST` / `STRESS` / `COG_CAL` / `START`).
 - Successful `GOTO` does **not** emit an ACK (keeps Bulk IN free for telemetry). Rejected `GOTO` still ACKs with `status=0`. Watch telem `mode == 9` to confirm tracking.
 
 ### Short ACK (optional)
@@ -138,7 +141,7 @@ Exception: successful `GOTO` (`0x06`, `status` would be 1) sends **no** ACK. `UP
 
 ## CDC side channel (debug only)
 
-CDC remains for logs. Text lines ending in `\n` or `\r` still accept: `START`, `STOP`, `SPRING`, `SPIN`, `TEST`, `STRESS`, `GOTO <mrad>`, `DUMP`, `UPLOAD`. Binary hosts should use Vendor Bulk only.
+CDC remains for logs. Text lines ending in `\n` or `\r` still accept: `START`, `STOP`, `SPRING`, `SPIN`, `TEST`, `STRESS`, `COGCAL`, `COGCLEAR`, `GOTO <mrad>`, `DUMP`, `UPLOAD`. Binary hosts should use Vendor Bulk only.
 
 Example: stream `GOTO 3142` (or Bulk `0x06` + LE int32) at your sim rate to track about +π rad absolute.
 

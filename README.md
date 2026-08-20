@@ -81,6 +81,8 @@ Vendor Bulk OUT opcodes:
 - `0x05` TEST
 - `0x06` GOTO, next 4 bytes = absolute `angle_mrad` (LE int32); tracking setpoint (streamable)
 - `0x07` STRESS burn-in (+full 3s / stop 1s / −full 3s / stop 1s, smooth Uq ramps)
+- `0x08` COG_CAL (slow +1 rev → cogging LUT)
+- `0x09` COG_CLEAR
 - `0x20` SET_K, byte 1 = K * 10
 - `0x21` SET_REST to current angle
 - `0x7F` UPLOAD reboot to UF2 bootloader (no ACK; device disconnects)
@@ -91,10 +93,12 @@ CDC commands (line ending `\n` or `\r`) remain for debug:
 
 - `START` run align, then idle (armed); **not** automatic at boot
 - `SPRING` virtual spring at current angle (needs align)
-- `SPIN` voltage flywheel (needs align). Stays voltage even when `CUR_LOOP_CTRL=1`
-  (current PI + `CS_TE_OFF` mix feels like cogging). Idle = 50% zero-voltage PWM.
+- `SPIN` coast (needs align): light drag + speed cap, no flywheel assist; cog FF cancels
+  detent. Flick harder → faster/longer spin. Idle = 50% zero-voltage PWM.
 - `TEST` loop ±360° with 5th-order ease (~1.4s move + ≤200ms hold) (needs align)
 - `STRESS` burn-in loop: +full 3s, stop 1s, −full 3s, stop 1s; 500ms smoothstep Uq on start/stop (needs align)
+- `COGCAL` RAM LUT override (~8s); prefer `tools/cog_cal.py --host-learn --write src/cog_lut_default.h`
+- `COGCLEAR` restore flash LUT; `COGDUMP` print active table
 - `GOTO <mrad>` enter tracking mode / update absolute setpoint in milliradians (needs align)
 - `STOP` brake / idle, keep align
 - `DUMP` print one full SSI frame (bits + shift candidates), waits on CDC so lines are complete

@@ -16,6 +16,10 @@ GPIO2  ------------- PWM_A / INHA
 GPIO4  ------------- PWM_B / INHB
 GPIO6  ------------- PWM_C / INHC
 GPIO8  ------------- EN / nSLEEP (active high; not DRVOFF)
+GPIO26 <------------ SOA / CSA
+GPIO27 <------------ SOB / CSB
+GPIO28 <------------ SOC / CSC
+GPIO29 <------------ 0.1×VCC (bus sense; do not wire raw VCC to MCU)
 GND    ------------- GND
 
 RP2040-Zero          MT6701
@@ -28,7 +32,7 @@ GND    ------------- GND
 
 Firmware holds GPIO8 high from boot. DRV8316 is 3x PWM. Motor is a 4015 gimbal, 11 pole pairs. GPIO3/5/7 are left free for INLx later.
 
-Current-sense (SOA/SOB/SOC) is reserved for a later ADC current loop.
+Current loop (`pins.h`): `CUR_LOOP_EN=1` samples CSA (mid-low PWM window) and fills telem Id/Iq; `CUR_LOOP_CTRL=1` also closes Id/Iq PI on most modes (`SPIN` stays voltage flywheel). Tune `CS_SIGN` / `CS_PHASE_ORD` / `CS_TE_OFF` if `|Id|≫|Iq|` under pure Uq. Match `CS_GAIN_V_PER_A` to the GAIN pin; SOX needs the datasheet RC LPF. Agent bring-up loop: [AGENTS.md](AGENTS.md).
 
 ## Prepare
 
@@ -52,11 +56,21 @@ make rebuild
 
 ## Usage
 
-On power-up the firmware runs align automatically (`START`), then returns to IDLE (armed, green LED). Switch feel with `SPRING` / `SPIN` / `TEST` / `STRESS` / `GOTO` / `STOP`. Continuous SSI CRC failures trip FAULT (red LED) and return to idle at 50% zero-voltage PWM. True phase Hi-Z needs INLx wired later.
+On power-up the firmware stays **IDLE** (green LED) until you send `START` (Bulk `0x01` or CDC). Align then returns to IDLE (armed). Switch feel with `SPRING` / `SPIN` / `TEST` / `STRESS` / `GOTO` / `STOP`. Continuous SSI CRC failures trip FAULT (red LED) and return to idle at 50% zero-voltage PWM. True phase Hi-Z needs INLx wired later.
 
 LED (WS2812): orange blink = aligning; green = idle; blue = spring; cyan = spin; white blink = TEST; magenta blink = STRESS; yellow = POS; red = fault; purple = UPLOAD (before bootrom).
 
 USB enumerates CDC (logs) and a Vendor Bulk interface. Hosts should use Vendor Bulk for realtime telemetry and mode commands; full layout is in [docs/usb-protocol.md](docs/usb-protocol.md).
+
+### FOC sense-only check (host)
+
+With `CUR_LOOP_CTRL=0`, run a GOTO sweep and auto-diagnose Park/TE alignment:
+
+```shell
+pip install pyusb numpy
+python3 tools/foc_sense_check.py
+python3 tools/foc_sense_check.py --revs 1 --seconds 5 --save /tmp/foc_sense.npz
+```
 
 Vendor Bulk OUT opcodes:
 
@@ -71,15 +85,14 @@ Vendor Bulk OUT opcodes:
 - `0x21` SET_REST to current angle
 - `0x7F` UPLOAD reboot to UF2 bootloader (no ACK; device disconnects)
 
-Bulk IN pushes 16-byte frames (~1 kHz): magic `0xA5`, mode, angle_mrad, phase duties Q15, seq.
+Bulk IN pushes 24-byte frames (~1 kHz): magic `0xA5`, mode, angle, duties, seq, Id/Iq/Iq_ref (mA), Vbus (mV), Uq Q15.
 
 CDC commands (line ending `\n` or `\r`) remain for debug:
 
-- `START` re-run align, then idle (armed); also runs once at boot
+- `START` run align, then idle (armed); **not** automatic at boot
 - `SPRING` virtual spring at current angle (needs align)
-- `SPIN` voltage-mode flywheel (needs align). Under-compensates BEMF so it will not
-  self-spin; feel is draggy until an `Iq` current loop can hold `Iq≈0` (needs CSA/CSB/CSC).
-  `Uq=0` / idle use 50% zero-voltage PWM (no INLx Hi-Z yet).
+- `SPIN` voltage flywheel (needs align). Stays voltage even when `CUR_LOOP_CTRL=1`
+  (current PI + `CS_TE_OFF` mix feels like cogging). Idle = 50% zero-voltage PWM.
 - `TEST` loop ±360° with 5th-order ease (~1.4s move + ≤200ms hold) (needs align)
 - `STRESS` burn-in loop: +full 3s, stop 1s, −full 3s, stop 1s; 500ms smoothstep Uq on start/stop (needs align)
 - `GOTO <mrad>` enter tracking mode / update absolute setpoint in milliradians (needs align)

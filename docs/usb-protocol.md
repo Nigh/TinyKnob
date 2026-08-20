@@ -43,7 +43,7 @@ On Linux with libusb, prefer matching by VID/PID then selecting the interface wi
 
 ## Telemetry stream (device → host, Bulk IN)
 
-The device pushes fixed 16-byte frames at about **1 kHz** when the host keeps Bulk IN outstanding and the bus is free. Do not assume a hard realtime guarantee.
+The device pushes fixed **24-byte** frames at about **1 kHz** when the host keeps Bulk IN outstanding and the bus is free. Do not assume a hard realtime guarantee.
 
 ### Frame layout
 
@@ -56,14 +56,21 @@ The device pushes fixed 16-byte frames at about **1 kHz** when the host keeps Bu
 | 8–9 | `i16` | `duty_b` | Phase B PWM duty, Q15 |
 | 10–11 | `i16` | `duty_c` | Phase C PWM duty, Q15 |
 | 12–13 | `u16` | `seq` | Monotonic counter (wraps) |
-| 14–15 | `u16` | `reserved` | `0` |
+| 14–15 | `i16` | `id_mA` | Measured Id (milliamps) |
+| 16–17 | `i16` | `iq_mA` | Measured Iq (milliamps) |
+| 18–19 | `i16` | `iq_ref_mA` | Iq reference (milliamps) |
+| 20–21 | `u16` | `vbus_mV` | Bus voltage from 0.1×VCC sense (millivolts) |
+| 22–23 | `i16` | `uq_q15` | Current-loop Uq output (normalized, Q15; 32767 ≈ full) |
 
-Total size: **16 bytes**.
+Total size: **24 bytes**. Bytes 0–13 match the previous 16-byte frame prefix (reserved was replaced).
 
 ### Units
 
 - **Physical angle**: `angle_mrad = round(pos * (2π / 16384) * 1000)` where `pos` is the unwrapped MT6701 count (14-bit sensor, unwrapped in firmware). Positive direction follows encoder increase. Not wrapped to ±π; it grows with turns.
 - **Duty Q15**: duty cycle in `[0, 1]` mapped as `q15 = (int16_t)(duty * 32767)`. Midpoint `0.5` ≈ `16383` is zero line-to-line voltage (idle, deadzone, and `U≈0`). Active drive swings around this midpoint.
+- **Currents**: milliamps, little-endian `i16`. With `CUR_LOOP_EN=0`, Id/Iq stay near 0. With `CUR_LOOP_EN=1` and `CUR_LOOP_CTRL=0` (sense-only), Id/Iq update while outer loops stay voltage-mode; `iq_ref_mA` is still the would-be current command for comparison.
+- **Vbus**: millivolts from the 0.1× divider (`Vbus = Vad / 0.1`).
+- **Uq Q15**: last current-loop voltage command on q-axis (`uq_out * 32767`), useful to see PI wind-up while debugging shake.
 
 ### Mode values (`mode`)
 
@@ -76,7 +83,7 @@ Total size: **16 bytes**.
 | 4 | `MOTOR_ALIGN_DOWN` | Align ramp down |
 | 5 | `MOTOR_TEST` | ±360° test move |
 | 6 | `MOTOR_SPRING` | Virtual spring |
-| 7 | `MOTOR_SPIN` | Voltage-mode flywheel |
+| 7 | `MOTOR_SPIN` | Flywheel (`CUR_LOOP_EN`: voltage or Iq≈0) |
 | 8 | `MOTOR_FAULT` | Fault (CRC etc.); brake |
 | 9 | `MOTOR_POS` | Track absolute angle (streaming setpoint) |
 | 10 | `MOTOR_STRESS` | Burn-in: +full / stop / −full / stop with smooth Uq ramps |
@@ -87,7 +94,7 @@ Each command is one Bulk OUT transfer. Byte 0 is the opcode; payload follows imm
 
 | `cmd` | Name | Payload | Effect |
 |-------|------|---------|--------|
-| `0x01` | `START` | none | Run align, then idle (armed) |
+| `0x01` | `START` | none | Run align, then idle (armed). **Not** automatic at boot — device powers up IDLE until START. |
 | `0x02` | `STOP` | none | Brake / idle; keep align |
 | `0x03` | `SPRING` | none | Enter spring (needs prior align) |
 | `0x04` | `SPIN` | none | Enter spin (needs prior align) |
@@ -117,7 +124,7 @@ After a command, the device may write a 3-byte packet on Bulk IN:
 | 1 | `u8` | echoed `cmd` |
 | 2 | `u8` | `status`: `1` = ok, `0` = rejected (e.g. SPRING/SPIN/TEST/GOTO before align, or `GOTO` with short payload) |
 
-Hosts **may ignore** ACKs. Distinguish from telemetry by `magic`: `0xA5` = telem, `0x5A` = ack. If a read returns a length other than 16, or magic is `0x5A`, treat as ack (or skip).
+Hosts **may ignore** ACKs. Distinguish from telemetry by `magic`: `0xA5` = telem, `0x5A` = ack. If a read returns a length other than 24, or magic is `0x5A`, treat as ack (or skip).
 
 Exception: successful `GOTO` (`0x06`, `status` would be 1) sends **no** ACK. `UPLOAD` (`0x7F`) also sends **no** ACK — the device reboots into bootrom before a reply can go out.
 
@@ -159,14 +166,21 @@ def read_telem():
     data = bytes(dev.read(EP_IN, 64, timeout=1000))
     if len(data) >= 3 and data[0] == 0x5A:
         return ("ack", data[1], data[2])  # cmd, status
-    if len(data) < 16 or data[0] != 0xA5:
+    if len(data) < 24 or data[0] != 0xA5:
         return None
-    magic, mode, angle_mrad, da, db, dc, seq, _ = struct.unpack_from("<BBi3hHH", data, 0)
+    magic, mode, angle_mrad, da, db, dc, seq, id_ma, iq_ma, iq_ref_ma, vbus_mv, uq_q15 = (
+        struct.unpack_from("<BBi3hHhhhHh", data, 0)
+    )
     return {
         "mode": mode,
         "angle_mrad": angle_mrad,
         "duty": (da / 32767.0, db / 32767.0, dc / 32767.0),
         "seq": seq,
+        "id_A": id_ma / 1000.0,
+        "iq_A": iq_ma / 1000.0,
+        "iq_ref_A": iq_ref_ma / 1000.0,
+        "vbus_V": vbus_mv / 1000.0,
+        "uq": uq_q15 / 32767.0,
     }
 
 send_cmd(0x01)           # START
@@ -196,8 +210,12 @@ typedef struct __attribute__((packed)) {
 	int16_t  duty_b;
 	int16_t  duty_c;
 	uint16_t seq;
-	uint16_t reserved;
-} tinyknob_telem_t; /* 16 bytes */
+	int16_t  id_mA;
+	int16_t  iq_mA;
+	int16_t  iq_ref_mA;
+	uint16_t vbus_mV;
+	int16_t  uq_q15;      /* current-loop Uq, Q15 */
+} tinyknob_telem_t; /* 24 bytes */
 
 typedef struct __attribute__((packed)) {
 	uint8_t magic;  /* 0x5A */

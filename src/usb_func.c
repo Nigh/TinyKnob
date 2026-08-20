@@ -166,17 +166,46 @@ static void vendor_send_ack(uint8_t cmd, uint8_t status) {
 	tud_vendor_n_write_flush(0);
 }
 
+static int16_t amp_to_ma(float a) {
+	float ma = a * 1000.f;
+	if(ma > 32767.f)
+		return 32767;
+	if(ma < -32768.f)
+		return -32768;
+	return (int16_t)ma;
+}
+
+static uint16_t volt_to_mv(float v) {
+	float mv = v * 1000.f;
+	if(mv < 0.f)
+		return 0;
+	if(mv > 65535.f)
+		return 65535;
+	return (uint16_t)mv;
+}
+
 static void vendor_send_telem(void) {
 	if(!usb_mounted || !tud_vendor_n_mounted(0))
 		return;
-	if(tud_vendor_n_write_available(0) < 16)
+	if(tud_vendor_n_write_available(0) < 24)
 		return;
 
 	static uint16_t seq;
 	motor_state_t st;
 	motor_get_state(&st);
 
-	uint8_t pkt[16];
+	int16_t id_ma = amp_to_ma(st.id_a);
+	int16_t iq_ma = amp_to_ma(st.iq_a);
+	int16_t iq_ref_ma = amp_to_ma(st.iq_ref_a);
+	uint16_t vbus_mv = volt_to_mv(st.vbus_v);
+	float uq = st.uq_out;
+	if(uq > 1.f)
+		uq = 1.f;
+	if(uq < -1.f)
+		uq = -1.f;
+	int16_t uq_q15 = (int16_t)(uq * 32767.f);
+
+	uint8_t pkt[24];
 	pkt[0] = TELEM_MAGIC;
 	pkt[1] = st.mode;
 	pkt[2] = (uint8_t)st.angle_mrad;
@@ -191,11 +220,19 @@ static void vendor_send_telem(void) {
 	pkt[11] = (uint8_t)(st.duty_c_q15 >> 8);
 	pkt[12] = (uint8_t)seq;
 	pkt[13] = (uint8_t)(seq >> 8);
-	pkt[14] = 0;
-	pkt[15] = 0;
+	pkt[14] = (uint8_t)id_ma;
+	pkt[15] = (uint8_t)(id_ma >> 8);
+	pkt[16] = (uint8_t)iq_ma;
+	pkt[17] = (uint8_t)(iq_ma >> 8);
+	pkt[18] = (uint8_t)iq_ref_ma;
+	pkt[19] = (uint8_t)(iq_ref_ma >> 8);
+	pkt[20] = (uint8_t)vbus_mv;
+	pkt[21] = (uint8_t)(vbus_mv >> 8);
+	pkt[22] = (uint8_t)uq_q15;
+	pkt[23] = (uint8_t)(uq_q15 >> 8);
 	seq++;
 
-	tud_vendor_n_write(0, pkt, 16);
+	tud_vendor_n_write(0, pkt, 24);
 	tud_vendor_n_write_flush(0);
 }
 

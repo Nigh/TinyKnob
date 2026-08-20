@@ -92,10 +92,10 @@ void main_handler(uevt_t* evt) {
 				bool fast = (st.mode >= MOTOR_ALIGN_RAMP && st.mode <= MOTOR_ALIGN_DOWN) ||
 						st.mode == MOTOR_TEST || st.mode == MOTOR_STRESS || st.mode == MOTOR_POS;
 				if(fast || (tick & 3) == 0) {
-					LOG_RAW("m%u p%ld o%lu f%lu d%d\n",
+					LOG_RAW("m%u p%ld o%lu f%lu d%d id%.2f iq%.2f v%.1f\n",
 							st.mode, (long)st.pos,
 							(unsigned long)st.crc_ok, (unsigned long)st.crc_fail,
-							st.dir);
+							st.dir, st.id_a, st.iq_a, st.vbus_v);
 					mt6701_log_brief(st.pio_word);
 				}
 			}
@@ -285,10 +285,7 @@ int main() {
 	add_repeating_timer_us(249978ul, timer_4hz_callback, NULL, &timer);
 	tusb_init();
 	cdc_log_init();
-	LOG_RAW("boot: auto START after 500ms; Bulk Vendor + CDC SPRING SPIN TEST STRESS GOTO STOP DUMP UPLOAD\n");
-	// ponytail: wait for rails/encoder to settle before align.
-	sleep_ms(500);
-	motor_start();
+	LOG_RAW("boot: IDLE; send START (Bulk 0x01 / CDC) to align. SPRING SPIN TEST STRESS GOTO STOP DUMP UPLOAD\n");
 	while(true) {
 		app_sched_execute();
 		tud_task();

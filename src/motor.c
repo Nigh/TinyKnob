@@ -2,7 +2,9 @@
 #include "pins.h"
 #include "mt6701.h"
 #include "platform.h"
+#include "pico/stdlib.h"
 #include "hardware/pwm.h"
+#include "hardware/adc.h"
 #include "hardware/clocks.h"
 #include "hardware/gpio.h"
 #include "hardware/irq.h"
@@ -17,6 +19,15 @@
 #define PWM_MIN_MAG2 (PWM_MIN_MAG * PWM_MIN_MAG)
 #define SPRING_VEL_ALPHA (TWO_PI * SPRING_VEL_LP_HZ / (float)PWM_HZ)
 #define SPIN_VEL_ALPHA (TWO_PI * SPIN_VEL_LP_HZ / (float)PWM_HZ)
+#define ADC_TO_V (CS_VREF / 4095.f)
+#define INV_CS_GAIN (1.f / CS_GAIN_V_PER_A)
+#define CUR_DT_S ((float)CUR_LOOP_DIV / (float)PWM_HZ)
+#define CS_IQ_ALPHA (TWO_PI * CS_IQ_LP_HZ * (float)CUR_LOOP_DIV / (float)PWM_HZ)
+
+// DRV8316 §8.3.11.2 eqs (5)–(7): FOC three-shunt CSA cross-coupling correction.
+static const float CSA_C00 = 0.995832f, CSA_C01 = -0.028199f, CSA_C02 = -0.014988f;
+static const float CSA_C10 = 0.037737f, CSA_C11 = 1.007723f, CSA_C12 = -0.033757f;
+static const float CSA_C20 = 0.009226f, CSA_C21 = 0.029805f, CSA_C22 = 1.003268f;
 
 static float sin_lut[SIN_LUT_N];
 
@@ -65,6 +76,19 @@ static volatile float duty_c_cached;
 static volatile int32_t track_pos;
 static bool enc_ok_this;
 
+static float v_off_a, v_off_b, v_off_c;
+static float ia, ib, ic;
+static float id_meas, iq_meas;
+static float iq_ref_cached;
+static float vbus = 12.f;
+static float id_i, iq_i;
+static float ud_hold, uq_hold;
+static uint8_t cur_div;
+
+static void trip_fault(void);
+static bool overcurrent(void);
+static uint16_t duty_to_level(float d);
+
 static uint32_t ms_to_ticks(uint32_t ms) {
 	return (PWM_HZ * ms) / 1000u;
 }
@@ -75,6 +99,121 @@ static float clampf(float x, float lo, float hi) {
 	if(x > hi)
 		return hi;
 	return x;
+}
+
+static float adc_volt(uint input) {
+	adc_select_input(input);
+	return (float)adc_read() * ADC_TO_V;
+}
+
+static void cur_pi_reset(void) {
+	id_i = 0.f;
+	iq_i = 0.f;
+	ud_hold = 0.f;
+	uq_hold = 0.f;
+	iq_ref_cached = 0.f;
+	cur_div = 0;
+}
+
+static void csa_correct(float ia_s, float ib_s, float ic_s, float* ia_o, float* ib_o, float* ic_o) {
+	*ia_o = CSA_C00 * ia_s + CSA_C01 * ib_s + CSA_C02 * ic_s;
+	*ib_o = CSA_C10 * ia_s + CSA_C11 * ib_s + CSA_C12 * ic_s;
+	*ic_o = CSA_C20 * ia_s + CSA_C21 * ib_s + CSA_C22 * ic_s;
+}
+
+// RP2040 edge PWM: OUT high while ctr < level → LS on (INHx low) when ctr >= level.
+// Wait until mid of common low window so all three SOx are valid.
+static void wait_lowside_sample_window(void) {
+	uint16_t la = duty_to_level(duty_a_cached);
+	uint16_t lb = duty_to_level(duty_b_cached);
+	uint16_t lc = duty_to_level(duty_c_cached);
+	uint16_t hi = la;
+	if(lb > hi)
+		hi = lb;
+	if(lc > hi)
+		hi = lc;
+	uint16_t span = (uint16_t)(pwm_wrap - hi);
+	uint16_t target = (uint16_t)(hi + (span >> 1));
+	if(target <= hi && hi < (uint16_t)pwm_wrap)
+		target = (uint16_t)(hi + 1u);
+	uint32_t guard = (uint32_t)pwm_wrap + 8u;
+	while(pwm_get_counter(pwm_slice_a) < target && guard--)
+		tight_loop_contents();
+}
+
+static void map_phase_currents(float xa, float xb, float xc) {
+	xa *= CS_SIGN;
+	xb *= CS_SIGN;
+	xc *= CS_SIGN;
+#if CS_PHASE_ORD == 1
+	ia = xa;
+	ib = xc;
+	ic = xb;
+#elif CS_PHASE_ORD == 2
+	ia = xb;
+	ib = xa;
+	ic = xc;
+#elif CS_PHASE_ORD == 3
+	ia = xb;
+	ib = xc;
+	ic = xa;
+#elif CS_PHASE_ORD == 4
+	ia = xc;
+	ib = xa;
+	ic = xb;
+#elif CS_PHASE_ORD == 5
+	ia = xc;
+	ib = xb;
+	ic = xa;
+#else
+	ia = xa;
+	ib = xb;
+	ic = xc;
+#endif
+	// Kill zero-sequence (CSA CM / matched offset error); leftover αβ DC still needs good v_off.
+	float cm = (ia + ib + ic) * (1.f / 3.f);
+	ia -= cm;
+	ib -= cm;
+	ic -= cm;
+}
+
+// ponytail: sample mid-low after wrap IRQ. Ceiling: busy-wait in ISR (~0–25µs);
+// upgrade = phase-correct PWM or DMA triggered from compare.
+static void sample_phase_currents(void) {
+	wait_lowside_sample_window();
+	float va = adc_volt(0);
+	float vb = adc_volt(1);
+	float vc = adc_volt(2);
+	float ia_s = (va - v_off_a) * INV_CS_GAIN;
+	float ib_s = (vb - v_off_b) * INV_CS_GAIN;
+	float ic_s = (vc - v_off_c) * INV_CS_GAIN;
+	float xa, xb, xc;
+	csa_correct(ia_s, ib_s, ic_s, &xa, &xb, &xc);
+	map_phase_currents(xa, xb, xc);
+}
+
+static void sample_vbus_once(void) {
+	float vs = adc_volt(3);
+	vbus = vs / CS_VBUS_DIV;
+	if(vbus < 1.f)
+		vbus = 1.f;
+}
+
+// Must match runtime path: mid-low window at 50% duty. Unsynced avg left αβ DC → ~2×fe in Id/Iq.
+static void calibrate_csa_offset(void) {
+	motor_set_duty(0.5f, 0.5f, 0.5f);
+	float sa = 0.f, sb = 0.f, sc = 0.f;
+	for(uint32_t i = 0; i < 256u; i++) {
+		wait_lowside_sample_window();
+		sa += adc_volt(0);
+		sb += adc_volt(1);
+		sc += adc_volt(2);
+	}
+	v_off_a = sa * (1.f / 256.f);
+	v_off_b = sb * (1.f / 256.f);
+	v_off_c = sc * (1.f / 256.f);
+	id_meas = 0.f;
+	iq_meas = 0.f;
 }
 
 static int32_t spring_wrap(int32_t d) {
@@ -102,7 +241,6 @@ static bool spring_selfcheck(void) {
 		return false;
 	if(spring_uq(-2000, 0.f, SPRING_K) >= 0.f)
 		return false;
-	// 1 count through the LPF must not eat ~10° of restoring Uq
 	float v = SPRING_VEL_ALPHA * RAD_PER_COUNT * (float)PWM_HZ;
 	float u10 = SPRING_K * (10.f * 3.14159265f / 180.f);
 	if(SPRING_D * v >= u10 * 0.5f)
@@ -131,6 +269,8 @@ static float spin_uq(float vel) {
 	return clampf(u, -SPIN_UQ_MAX, SPIN_UQ_MAX);
 }
 
+// (spin_iq_cmd removed — SPIN stays voltage flywheel even with CUR_LOOP_CTRL)
+
 static bool spin_selfcheck(void) {
 	if(spin_uq(0.f) != 0.f)
 		return false;
@@ -143,12 +283,26 @@ static bool spin_selfcheck(void) {
 		return false;
 	if(spin_uq(2.f) <= 0.f || spin_uq(-2.f) >= 0.f)
 		return false;
-	float u2 = spin_uq(2.f);
-	if(u2 < net * 2.f - 0.002f || u2 > net * 2.f + 0.002f)
-		return false;
-	if(spin_uq(SPIN_W_MAX * 0.5f) <= 0.f)
-		return false;
 	if(SPIN_W_MAX <= SPIN_W_REST)
+		return false;
+	return true;
+}
+
+static bool csa_selfcheck(void) {
+	// Coefficient smoke + SOX↔I + TI matrix null-sum on equal sensed currents.
+	if(CSA_C00 < 0.99f || CSA_C00 > 1.01f)
+		return false;
+	if(CSA_C11 < 1.00f || CSA_C11 > 1.02f)
+		return false;
+	float i = 1.f;
+	float v = CS_VREF * 0.5f + CS_GAIN_V_PER_A * i;
+	float back = (v - CS_VREF * 0.5f) / CS_GAIN_V_PER_A;
+	if(back < 0.99f || back > 1.01f)
+		return false;
+	float ia_o, ib_o, ic_o;
+	csa_correct(0.5f, 0.5f, 0.5f, &ia_o, &ib_o, &ic_o);
+	float sum = ia_o + ib_o + ic_o;
+	if(sum < 1.4f || sum > 1.6f)
 		return false;
 	return true;
 }
@@ -176,6 +330,7 @@ static void motor_brake_low(void) {
 	uq_cmd = 0.f;
 	forced_te = 0.f;
 	te_from_encoder = false;
+	cur_pi_reset();
 	motor_set_duty(0.5f, 0.5f, 0.5f);
 }
 
@@ -193,6 +348,12 @@ void motor_get_state(motor_state_t* s) {
 	s->raw = last_raw;
 	s->pio_word = last_pio;
 	s->last_crc_ok = last_crc_ok;
+	s->id_a = id_meas;
+	s->iq_a = iq_meas;
+	s->iq_ref_a = iq_ref_cached;
+	s->vbus_v = vbus;
+	s->ud_out = ud_hold;
+	s->uq_out = uq_hold;
 }
 
 void motor_set_spring_k(float k) {
@@ -228,7 +389,6 @@ static void ingest_encoder(uint16_t raw) {
 }
 
 static void sincos_lut(float te, float* s_out, float* c_out) {
-	// Map te → [0,1) cycles without fmodf (soft-float heavy).
 	float turns = te * (1.f / TWO_PI);
 	turns -= (float)(int32_t)turns;
 	if(turns < 0.f)
@@ -240,13 +400,15 @@ static void sincos_lut(float te, float* s_out, float* c_out) {
 
 static void apply_voltage(float ud, float uq, float te) {
 	float mag2 = ud * ud + uq * uq;
-	// Deadzone / U=0 → 50% zero-voltage PWM (same as idle). SPIN keeps a tiny floor for BEMF follow.
+#if !(CUR_LOOP_EN && CUR_LOOP_CTRL)
 	if(mode == MOTOR_SPIN) {
 		if(mag2 < 1.0e-12f) {
 			motor_set_duty(0.5f, 0.5f, 0.5f);
 			return;
 		}
-	} else if(mag2 < PWM_MIN_MAG2) {
+	} else
+#endif
+	if(mag2 < PWM_MIN_MAG2) {
 		motor_set_duty(0.5f, 0.5f, 0.5f);
 		return;
 	}
@@ -265,14 +427,121 @@ static void apply_voltage(float ud, float uq, float te) {
 	motor_set_duty(0.5f + 0.5f * va, 0.5f + 0.5f * vb, 0.5f + 0.5f * vc);
 }
 
+#if CUR_LOOP_EN
+static void sense_park(float te) {
+	te += CS_TE_OFF;
+	float s, c;
+	sincos_lut(te, &s, &c);
+	float i_alpha = ia;
+	float i_beta = (ia + 2.f * ib) * (1.f / 1.73205080757f);
+	float id = i_alpha * c + i_beta * s;
+	float iq = -i_alpha * s + i_beta * c;
+	float a = CS_IQ_ALPHA;
+	if(a > 1.f)
+		a = 1.f;
+	id_meas += a * (id - id_meas);
+	iq_meas += a * (iq - iq_meas);
+}
+
+// Park/PI in (te+CS_TE_OFF); SVPWM in align te. TE_OFF was tuned so Iq@θ+φ tracks Uq@θ —
+// applying u at θ+φ breaks that plant (GOTO regress). Ceiling: residual φ mix on Iq≈0.
+#if CUR_LOOP_CTRL
+static void apply_current_svpwm(float te, float id_ref, float iq_ref) {
+	float te_i = te + CS_TE_OFF;
+	float s, c;
+	sincos_lut(te_i, &s, &c);
+	float i_alpha = ia;
+	float i_beta = (ia + 2.f * ib) * (1.f / 1.73205080757f);
+	float id = i_alpha * c + i_beta * s;
+	float iq = -i_alpha * s + i_beta * c;
+	float a = CS_IQ_ALPHA;
+	if(a > 1.f)
+		a = 1.f;
+	id_meas += a * (id - id_meas);
+	iq_meas += a * (iq - iq_meas);
+
+	float ed = id_ref - id_meas;
+	float eq = iq_ref - iq_meas;
+	id_i = clampf(id_i + CUR_KI * ed * CUR_DT_S, -CUR_U_MAX, CUR_U_MAX);
+	iq_i = clampf(iq_i + CUR_KI * eq * CUR_DT_S, -CUR_U_MAX, CUR_U_MAX);
+	float ud = clampf(CUR_KP * ed + id_i, -CUR_U_MAX, CUR_U_MAX);
+	float uq = clampf(CUR_KP * eq + iq_i, -CUR_U_MAX, CUR_U_MAX);
+	ud_hold = ud;
+	uq_hold = uq;
+
+	sincos_lut(te, &s, &c);
+	float mag2 = ud * ud + uq * uq;
+	if(mag2 < PWM_MIN_MAG2) {
+		motor_set_duty(0.5f, 0.5f, 0.5f);
+		return;
+	}
+	if(mag2 > 1.f) {
+		float inv = 1.f / sqrtf(mag2);
+		ud *= inv;
+		uq *= inv;
+	}
+	float ualpha = ud * c - uq * s;
+	float ubeta = ud * s + uq * c;
+	motor_set_duty(0.5f + 0.5f * ualpha,
+			0.5f + 0.5f * (-0.5f * ualpha + SQRT3_2 * ubeta),
+			0.5f + 0.5f * (-0.5f * ualpha - SQRT3_2 * ubeta));
+}
+
+static void apply_hold_svpwm(float te) {
+	apply_voltage(ud_hold, uq_hold, te);
+}
+#endif
+#endif
+
 static void apply_cmd(void) {
 	float te = forced_te;
 	if(te_from_encoder) {
 		float th_m = (float)pos * RAD_PER_COUNT;
 		te = (float)dir * th_m * (float)MOTOR_POLE_PAIRS + offset_rad;
 	}
+#if CUR_LOOP_EN
+	if(te_from_encoder) {
+		float uq = (float)dir * uq_cmd;
+		float iq_ref = uq * IQ_CMD_A;
+		iq_ref_cached = iq_ref;
+		// SPIN: voltage flywheel (current PI + TE_OFF mix makes cogging worse).
+		bool spin_volt = (mode == MOTOR_SPIN);
+#if CUR_LOOP_CTRL
+		if(!spin_volt) {
+			if(++cur_div >= CUR_LOOP_DIV) {
+				cur_div = 0;
+				sample_phase_currents();
+				if(overcurrent()) {
+					trip_fault();
+					return;
+				}
+				apply_current_svpwm(te, 0.f, iq_ref);
+				return;
+			}
+			apply_hold_svpwm(te);
+			return;
+		}
+#endif
+		if(++cur_div >= CUR_LOOP_DIV) {
+			cur_div = 0;
+			sample_phase_currents();
+			if(overcurrent()) {
+				trip_fault();
+				return;
+			}
+			sense_park(te);
+		}
+		ud_hold = ud_cmd;
+		uq_hold = uq;
+		apply_voltage(ud_cmd, uq, te);
+		return;
+	}
+	iq_ref_cached = 0.f;
+	apply_voltage(ud_cmd, uq_cmd, te);
+#else
 	float uq = te_from_encoder ? (float)dir * uq_cmd : uq_cmd;
 	apply_voltage(ud_cmd, uq, te);
+#endif
 }
 
 static void enter_mode(uint8_t next) {
@@ -280,7 +549,6 @@ static void enter_mode(uint8_t next) {
 	mode_tick = 0;
 }
 
-// 5th-order smoothstep s=10t³−15t⁴+6t⁵ (zero accel at ends).
 static float smoothstep5(float t) {
 	if(t <= 0.f)
 		return 0.f;
@@ -314,7 +582,6 @@ static bool follow_move(void) {
 	if(move == 0)
 		move = 1;
 	float t = (mode_tick < move) ? ((float)mode_tick / (float)move) : 1.f;
-	// 5th-order smoothstep: s=10t³−15t⁴+6t⁵, ds/dt=30t²(1−t)²
 	float s;
 	float dsdt;
 	if(t <= 0.f) {
@@ -348,6 +615,13 @@ static void trip_fault(void) {
 	enter_mode(MOTOR_FAULT);
 }
 
+static bool overcurrent(void) {
+	float aa = ia < 0.f ? -ia : ia;
+	float bb = ib < 0.f ? -ib : ib;
+	float cc = ic < 0.f ? -ic : ic;
+	return aa > I_TRIP_A || bb > I_TRIP_A || cc > I_TRIP_A;
+}
+
 static void motor_isr(void) {
 	enc_ok_this = false;
 	mt6701_sample_t s;
@@ -373,7 +647,6 @@ static void motor_isr(void) {
 	mt6701_start_read();
 
 	if(mode == MOTOR_IDLE || mode == MOTOR_FAULT) {
-		// Outputs already at 50% from motor_brake_low; wrap IRQ still paces SSI.
 		return;
 	}
 
@@ -396,7 +669,6 @@ static void motor_isr(void) {
 			break;
 		}
 		case MOTOR_ALIGN_HOLD: {
-			// ponytail: static Ud loses to cogging; drag d-axis 2 elec revs then hold. Current-sense ident later.
 			uint32_t drag = ms_to_ticks(ALIGN_DRAG_MS);
 			uint32_t hold = ms_to_ticks(ALIGN_HOLD_MS);
 			if(drag == 0)
@@ -451,7 +723,7 @@ static void motor_isr(void) {
 				else if(dp > (int32_t)DIR_PULSE_COUNTS)
 					dir = 1;
 				else
-					dir = -1; // no motion: treat as reversed phase sequence
+					dir = -1;
 				offset_rad = -(float)dir * align_theta_m * (float)MOTOR_POLE_PAIRS;
 				enter_mode(MOTOR_ALIGN_DOWN);
 			}
@@ -483,8 +755,6 @@ static void motor_isr(void) {
 			}
 			break;
 		case MOTOR_POS: {
-			// ponytail: P+D toward track_pos each PWM tick. Ceiling: lag on fast sim;
-			// upgrade = host ω feedforward in the GOTO payload.
 			float err = (float)(track_pos - pos) * RAD_PER_COUNT;
 			float vel = vel_update(SPRING_VEL_ALPHA);
 			ud_cmd = 0.f;
@@ -506,7 +776,6 @@ static void motor_isr(void) {
 			break;
 		}
 		case MOTOR_STRESS: {
-			// phases: ramp+ / run+ / ramp0 / stop / ramp- / run- / ramp0 / stop → loop
 			ud_cmd = 0.f;
 			te_from_encoder = true;
 			uint32_t ramp = ms_to_ticks(STRESS_RAMP_MS);
@@ -519,50 +788,50 @@ static void motor_isr(void) {
 			if(stop == 0)
 				stop = 1;
 			switch(stress_phase) {
-				case 0: { // ramp to +full
-					float s = smoothstep5((float)mode_tick / (float)ramp);
-					uq_cmd = STRESS_UQ_MAX * s;
+				case 0: {
+					float ss = smoothstep5((float)mode_tick / (float)ramp);
+					uq_cmd = STRESS_UQ_MAX * ss;
 					if(mode_tick >= ramp)
 						stress_advance(1);
 					break;
 				}
-				case 1: // hold +full
+				case 1:
 					uq_cmd = STRESS_UQ_MAX;
 					if(mode_tick >= run)
 						stress_advance(2);
 					break;
-				case 2: { // ramp +full → 0
-					float s = smoothstep5((float)mode_tick / (float)ramp);
-					uq_cmd = STRESS_UQ_MAX * (1.f - s);
+				case 2: {
+					float ss = smoothstep5((float)mode_tick / (float)ramp);
+					uq_cmd = STRESS_UQ_MAX * (1.f - ss);
 					if(mode_tick >= ramp)
 						stress_advance(3);
 					break;
 				}
-				case 3: // stop
+				case 3:
 					uq_cmd = 0.f;
 					if(mode_tick >= stop)
 						stress_advance(4);
 					break;
-				case 4: { // ramp to -full
-					float s = smoothstep5((float)mode_tick / (float)ramp);
-					uq_cmd = -STRESS_UQ_MAX * s;
+				case 4: {
+					float ss = smoothstep5((float)mode_tick / (float)ramp);
+					uq_cmd = -STRESS_UQ_MAX * ss;
 					if(mode_tick >= ramp)
 						stress_advance(5);
 					break;
 				}
-				case 5: // hold -full
+				case 5:
 					uq_cmd = -STRESS_UQ_MAX;
 					if(mode_tick >= run)
 						stress_advance(6);
 					break;
-				case 6: { // ramp -full → 0
-					float s = smoothstep5((float)mode_tick / (float)ramp);
-					uq_cmd = -STRESS_UQ_MAX * (1.f - s);
+				case 6: {
+					float ss = smoothstep5((float)mode_tick / (float)ramp);
+					uq_cmd = -STRESS_UQ_MAX * (1.f - ss);
 					if(mode_tick >= ramp)
 						stress_advance(7);
 					break;
 				}
-				case 7: // stop, then loop
+				case 7:
 					uq_cmd = 0.f;
 					if(mode_tick >= stop)
 						stress_advance(0);
@@ -597,8 +866,14 @@ void motor_start(void) {
 	forced_te = 0.f;
 	ud_cmd = 0.f;
 	uq_cmd = 0.f;
-	// Ensure PWM counters are running before first FOC update
+	cur_pi_reset();
 	pwm_set_mask_enabled(pwm_enable_mask);
+#if CUR_LOOP_EN
+	// IRQ off: synced offset at 50% before Ud injects current.
+	irq_set_enabled(PWM_IRQ_WRAP, false);
+	calibrate_csa_offset();
+	irq_set_enabled(PWM_IRQ_WRAP, true);
+#endif
 	enter_mode(MOTOR_ALIGN_RAMP);
 }
 
@@ -608,6 +883,9 @@ void motor_cmd_stop(void) {
 	}
 	irq_set_enabled(PWM_IRQ_WRAP, false);
 	motor_brake_low();
+#if CUR_LOOP_EN
+	calibrate_csa_offset();
+#endif
 	enter_mode(MOTOR_IDLE);
 	irq_set_enabled(PWM_IRQ_WRAP, true);
 }
@@ -619,6 +897,7 @@ bool motor_cmd_spring(void) {
 	rest_pos = pos;
 	pos_last = pos;
 	vel_filt = 0.f;
+	cur_pi_reset();
 	enter_mode(MOTOR_SPRING);
 	irq_set_enabled(PWM_IRQ_WRAP, true);
 	return true;
@@ -630,6 +909,7 @@ bool motor_cmd_spin(void) {
 	irq_set_enabled(PWM_IRQ_WRAP, false);
 	pos_last = pos;
 	vel_filt = 0.f;
+	cur_pi_reset();
 	enter_mode(MOTOR_SPIN);
 	irq_set_enabled(PWM_IRQ_WRAP, true);
 	return true;
@@ -641,6 +921,7 @@ bool motor_cmd_test(void) {
 	irq_set_enabled(PWM_IRQ_WRAP, false);
 	home_pos = pos;
 	test_fwd = true;
+	cur_pi_reset();
 	start_move(home_pos + COUNTS_PER_REV, MOTOR_TEST);
 	irq_set_enabled(PWM_IRQ_WRAP, true);
 	return true;
@@ -651,6 +932,7 @@ bool motor_cmd_stress(void) {
 		return false;
 	irq_set_enabled(PWM_IRQ_WRAP, false);
 	stress_phase = 0;
+	cur_pi_reset();
 	enter_mode(MOTOR_STRESS);
 	irq_set_enabled(PWM_IRQ_WRAP, true);
 	return true;
@@ -665,6 +947,7 @@ bool motor_cmd_goto(int32_t angle_mrad) {
 	if(mode != MOTOR_POS) {
 		pos_last = pos;
 		vel_filt = 0.f;
+		cur_pi_reset();
 		enter_mode(MOTOR_POS);
 	}
 	irq_set_enabled(PWM_IRQ_WRAP, true);
@@ -672,7 +955,6 @@ bool motor_cmd_goto(int32_t angle_mrad) {
 }
 
 static bool pos_selfcheck(void) {
-	// One mech rev ↔ mrad ↔ counts (telemetry units).
 	int32_t mrad = (int32_t)((float)COUNTS_PER_REV * RAD_PER_COUNT * 1000.f);
 	int32_t back = (int32_t)((float)mrad / (RAD_PER_COUNT * 1000.f));
 	int32_t err = back - (int32_t)COUNTS_PER_REV;
@@ -694,7 +976,6 @@ static bool stress_selfcheck(void) {
 }
 
 void motor_setup(void) {
-	// ponytail: 1024-pt sin LUT (~4KB); cos = lut[i+N/4]. Ceiling: ~0.35°; upgrade = lerp.
 	for(uint32_t i = 0; i < SIN_LUT_N; i++)
 		sin_lut[i] = sinf((float)i * (TWO_PI / (float)SIN_LUT_N));
 	if(!spring_selfcheck())
@@ -705,10 +986,30 @@ void motor_setup(void) {
 		LOG_RAW("pos selfcheck FAIL\n");
 	if(!stress_selfcheck())
 		LOG_RAW("stress selfcheck FAIL\n");
+	if(!csa_selfcheck())
+		LOG_RAW("csa selfcheck FAIL\n");
+#if CUR_LOOP_EN
+#if CUR_LOOP_CTRL
+	LOG_RAW("cur loop CTRL div=%u (~%u Hz) sign=%.0f ord=%d te_off=%.2f\n",
+			(unsigned)CUR_LOOP_DIV, (unsigned)(PWM_HZ / CUR_LOOP_DIV), (double)CS_SIGN,
+			(int)CS_PHASE_ORD, (double)CS_TE_OFF);
+#else
+	LOG_RAW("cur loop SENSE-ONLY div=%u (~%u Hz) sign=%.0f ord=%d te_off=%.2f\n",
+			(unsigned)CUR_LOOP_DIV, (unsigned)(PWM_HZ / CUR_LOOP_DIV), (double)CS_SIGN,
+			(int)CS_PHASE_ORD, (double)CS_TE_OFF);
+#endif
+	adc_init();
+	adc_gpio_init(PIN_CSA);
+	adc_gpio_init(PIN_CSB);
+	adc_gpio_init(PIN_CSC);
+	adc_gpio_init(PIN_VBUS);
+#else
+	LOG_RAW("cur loop OFF (light ISR)\n");
+#endif
 
 	gpio_init(PIN_DRV_EN);
 	gpio_set_dir(PIN_DRV_EN, GPIO_OUT);
-	gpio_put(PIN_DRV_EN, 1); // nSLEEP/EN, active high
+	gpio_put(PIN_DRV_EN, 1);
 
 	gpio_set_function(PIN_PWM_A, GPIO_FUNC_PWM);
 	gpio_set_function(PIN_PWM_B, GPIO_FUNC_PWM);
@@ -736,12 +1037,17 @@ void motor_setup(void) {
 	mode = MOTOR_IDLE;
 	mode_tick = 0;
 
+	pwm_set_mask_enabled(pwm_enable_mask);
+#if CUR_LOOP_EN
+	calibrate_csa_offset();
+	sample_vbus_once();
+	LOG_RAW("csa offset %.3f %.3f %.3f V vbus=%.1f\n", v_off_a, v_off_b, v_off_c, vbus);
+#endif
+
 	pwm_clear_irq(pwm_slice_a);
 	pwm_set_irq_enabled(pwm_slice_a, true);
 	irq_set_exclusive_handler(PWM_IRQ_WRAP, pwm_wrap_isr);
 	irq_set_enabled(PWM_IRQ_WRAP, true);
 
-	// Enable counters for SSI pacing; idle outputs sit at 50% zero-voltage PWM
-	pwm_set_mask_enabled(pwm_enable_mask);
 	mt6701_start_read();
 }

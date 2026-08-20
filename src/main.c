@@ -11,6 +11,7 @@
 #include "led_drv.h"
 #include "mt6701.h"
 #include "motor.h"
+#include "pins.h"
 
 #include "tusb_config.h"
 
@@ -38,8 +39,9 @@ bool timer_4hz_callback(struct repeating_timer* t) {
 
 #define U32RGB(r, g, b) (((uint32_t)(r) << 8) | ((uint32_t)(g) << 16) | (uint32_t)(b))
 
-// LED: align=orange blink, idle=green, spring=blue, spin=cyan, test=white blink,
-	// pos=yellow (tracking), stress=magenta blink, fault=red. UPLOAD purple is set in enter_uf2_bootloader before bootrom.
+// LED: align=orange blink, idle unaligned=green blink, idle armed=green, spring=blue,
+	// spin=cyan, test=white blink, pos=yellow, stress=magenta blink, fault=red.
+	// UPLOAD purple is set in enter_uf2_bootloader before bootrom.
 static void led_status(void) {
 	static uint8_t tick;
 	motor_state_t st;
@@ -75,8 +77,15 @@ static void led_status(void) {
 		ws2812_setpixel(U32RGB(0, 24, 20));
 		return;
 	}
-	// IDLE (armed) and anything else
-	ws2812_setpixel(U32RGB(0, 22, 0));
+	if(st.mode == MOTOR_COG_CAL) {
+		ws2812_setpixel(on ? U32RGB(32, 16, 0) : U32RGB(8, 4, 0));
+		return;
+	}
+	// IDLE: blink green until START align; solid green when armed
+	if(!st.aligned)
+		ws2812_setpixel(on ? U32RGB(0, 22, 0) : U32RGB(0, 0, 0));
+	else
+		ws2812_setpixel(U32RGB(0, 22, 0));
 }
 
 void main_handler(uevt_t* evt) {
@@ -117,6 +126,8 @@ enum {
 	TK_CMD_TEST = 0x05,
 	TK_CMD_GOTO = 0x06,
 	TK_CMD_STRESS = 0x07,
+	TK_CMD_COG_CAL = 0x08,
+	TK_CMD_COG_CLEAR = 0x09,
 	TK_CMD_SET_K = 0x20,
 	TK_CMD_SET_REST = 0x21,
 	TK_CMD_UPLOAD = 0x7F,
@@ -158,6 +169,11 @@ int vendor_cmd(uint8_t const* buffer, uint16_t bufsize) {
 			return motor_cmd_test() ? 1 : 0;
 		case TK_CMD_STRESS:
 			return motor_cmd_stress() ? 1 : 0;
+		case TK_CMD_COG_CAL:
+			return motor_cmd_cog_cal() ? 1 : 0;
+		case TK_CMD_COG_CLEAR:
+			motor_cmd_cog_clear();
+			return 1;
 		case TK_CMD_GOTO: {
 			if(bufsize < 5)
 				return 0;
@@ -225,6 +241,23 @@ static void serial_handle_line(const char* line) {
 		}
 		return;
 	}
+	if(strcmp(line, "COGCAL") == 0) {
+		if(motor_cmd_cog_cal()) {
+			LOG_RAW("COGCAL ~%ums\n", (unsigned)COG_CAL_MS);
+		} else {
+			LOG_RAW("need START\n");
+		}
+		return;
+	}
+	if(strcmp(line, "COGCLEAR") == 0) {
+		motor_cmd_cog_clear();
+		LOG_RAW("COGCLEAR (restored flash LUT)\n");
+		return;
+	}
+	if(strcmp(line, "COGDUMP") == 0) {
+		motor_cog_dump();
+		return;
+	}
 	if(strncmp(line, "GOTO ", 5) == 0) {
 		char* end = NULL;
 		long v = strtol(line + 5, &end, 10);
@@ -270,6 +303,8 @@ void serial_receive(uint8_t const* buffer, uint16_t bufsize) {
 }
 
 #include "hardware/xosc.h"
+#include "hardware/irq.h"
+
 int main() {
 	xosc_init();
 
@@ -284,8 +319,10 @@ int main() {
 	struct repeating_timer timer;
 	add_repeating_timer_us(249978ul, timer_4hz_callback, NULL, &timer);
 	tusb_init();
+	// Above PWM wrap so any residual ISR wait can be preempted.
+	irq_set_priority(USBCTRL_IRQ, 0x40);
 	cdc_log_init();
-	LOG_RAW("boot: IDLE; send START (Bulk 0x01 / CDC) to align. SPRING SPIN TEST STRESS GOTO STOP DUMP UPLOAD\n");
+	LOG_RAW("boot: IDLE; send START then SPRING SPIN TEST STRESS COGCAL COGCLEAR GOTO STOP DUMP UPLOAD\n");
 	while(true) {
 		app_sched_execute();
 		tud_task();

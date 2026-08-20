@@ -12,10 +12,11 @@ enum {
 	MOTOR_ALIGN_DOWN,
 	MOTOR_TEST,
 	MOTOR_SPRING,
-	MOTOR_SPIN, // voltage flywheel (even if CUR_LOOP_CTRL; PI+TE_OFF mix cogging)
+	MOTOR_SPIN, // Iq=0 + BEMF FF when CUR_LOOP_CTRL; else open-loop spin_uq
 	MOTOR_FAULT,
 	MOTOR_POS, // track absolute angle_mrad (streaming setpoint)
 	MOTOR_STRESS, // full-speed fwd/rev burn-in with smooth Uq ramps
+	MOTOR_COG_CAL, // slow +1 rev; fill cogging LUT then IDLE
 };
 
 typedef struct {
@@ -38,6 +39,8 @@ typedef struct {
 	float vbus_v;
 	float ud_out;
 	float uq_out;
+	bool cog_en;
+	bool aligned; // false until START align completes
 } motor_state_t;
 
 void motor_setup(void);
@@ -47,6 +50,9 @@ bool motor_cmd_spring(void);
 bool motor_cmd_spin(void);
 bool motor_cmd_test(void);
 bool motor_cmd_stress(void);
+bool motor_cmd_cog_cal(void); // slow sweep → RAM LUT override
+void motor_cmd_cog_clear(void); // restore flash LUT (drop RAM override)
+void motor_cog_dump(void); // CDC: print active LUT
 bool motor_cmd_goto(int32_t angle_mrad); // set/track absolute mech angle (telem units)
 void motor_set_duty(float a, float b, float c);
 void motor_get_state(motor_state_t* s);

@@ -1,5 +1,6 @@
 #include "motor.h"
 #include "pins.h"
+#include "cog_lut_default.h"
 #include "mt6701.h"
 #include "platform.h"
 #include "pico/stdlib.h"
@@ -55,6 +56,7 @@ static uint8_t stress_phase;
 static int32_t move_start;
 static int32_t move_target;
 static int32_t rest_pos;
+static bool rest_hold; // SET_REST: next SPRING keeps this rest (host π sweep)
 static float spring_k = SPRING_K;
 static int32_t pos_last;
 static float vel_filt;
@@ -83,10 +85,18 @@ static float iq_ref_cached;
 static float vbus = 12.f;
 static float id_i, iq_i;
 static float ud_hold, uq_hold;
+static float uq_ff_cmd; /* SPIN BEMF FF (pre-dir); 0 elsewhere */
 static uint8_t cur_div;
+static uint32_t move_ms_override; // 0 → TEST_MOVE_MS
+static float cog_lut[COG_LUT_N];
+static float cog_sum[COG_LUT_N];
+static uint16_t cog_cnt[COG_LUT_N];
+static bool cog_en;
+static bool cog_ram_override; // true after COGCAL until COGCLEAR restores flash
 
 static void trip_fault(void);
 static bool overcurrent(void);
+static float cog_ff(int32_t p);
 static uint16_t duty_to_level(float d);
 
 static uint32_t ms_to_ticks(uint32_t ms) {
@@ -123,6 +133,8 @@ static void csa_correct(float ia_s, float ib_s, float ic_s, float* ia_o, float* 
 
 // RP2040 edge PWM: OUT high while ctr < level → LS on (INHx low) when ctr >= level.
 // Wait until mid of common low window so all three SOx are valid.
+// ponytail: busy-wait in wrap ISR (~30–40µs @50% duty). Alarm-defer broke SPIN (wrong window →
+// self-oscillation). Upgrade = PWM-compare/DMA sample (or RP2350) — do not re-defer without window check.
 static void wait_lowside_sample_window(void) {
 	uint16_t la = duty_to_level(duty_a_cached);
 	uint16_t lb = duty_to_level(duty_b_cached);
@@ -177,8 +189,7 @@ static void map_phase_currents(float xa, float xb, float xc) {
 	ic -= cm;
 }
 
-// ponytail: sample mid-low after wrap IRQ. Ceiling: busy-wait in ISR (~0–25µs);
-// upgrade = phase-correct PWM or DMA triggered from compare.
+// Mid-low CSA sample (sync wait). See wait_lowside_sample_window note.
 static void sample_phase_currents(void) {
 	wait_lowside_sample_window();
 	float va = adc_volt(0);
@@ -216,33 +227,53 @@ static void calibrate_csa_offset(void) {
 	iq_meas = 0.f;
 }
 
-static int32_t spring_wrap(int32_t d) {
-	d %= COUNTS_PER_REV;
-	if(d < 0)
-		d += COUNTS_PER_REV;
-	if(d > COUNTS_PER_REV / 2)
-		d -= COUNTS_PER_REV;
-	return d;
-}
-
+// Soft spring with effort envelope: UQ_MAX → WALL across ±π±BLEND (avoids flat→cliff chatter).
 static float spring_uq(int32_t d_counts, float vel, float k) {
-	float err = (float)spring_wrap(d_counts) * RAD_PER_COUNT;
-	return clampf(k * err - SPRING_D * vel, -SPRING_UQ_MAX, SPRING_UQ_MAX);
+	const float pi = 3.14159265f;
+	float err = (float)d_counts * RAD_PER_COUNT;
+	float ae = fabsf(err);
+	float env = SPRING_UQ_MAX;
+	float d = SPRING_D;
+	float lo = pi - SPRING_WALL_BLEND_RAD;
+	float hi = pi + SPRING_WALL_BLEND_RAD;
+	if(ae >= hi) {
+		env = SPRING_WALL_UQ;
+		d = SPRING_WALL_D;
+	} else if(ae > lo) {
+		float t = (ae - lo) / (hi - lo);
+		env = SPRING_UQ_MAX + t * (SPRING_WALL_UQ - SPRING_UQ_MAX);
+		d = SPRING_D + t * (SPRING_WALL_D - SPRING_D);
+	}
+	return clampf(k * err - d * vel, -env, env);
 }
 
 static bool spring_selfcheck(void) {
-	if(spring_wrap(100) != 100)
+	const float pi = 3.14159265f;
+	int32_t q = (int32_t)COUNTS_PER_REV / 4;
+	int32_t tq = (3 * (int32_t)COUNTS_PER_REV) / 4;
+	float u_q = spring_uq(q, 0.f, SPRING_K);
+	float u_tq = spring_uq(tq, 0.f, SPRING_K);
+	if(u_q <= 0.f || u_q > SPRING_UQ_MAX + 1e-3f)
 		return false;
-	if(spring_wrap(-100) != -100)
+	// Past π+blend: full wall, same sign as soft.
+	if(u_tq <= 0.f || u_tq < SPRING_WALL_UQ - 0.05f)
 		return false;
-	if(spring_wrap(COUNTS_PER_REV - 100) != -100)
+	if(spring_uq(-q, 0.f, SPRING_K) >= 0.f)
 		return false;
-	if(spring_uq(2000, 0.f, SPRING_K) <= 0.f)
+	if(spring_uq(-tq, 0.f, SPRING_K) >= 0.f)
 		return false;
-	if(spring_uq(-2000, 0.f, SPRING_K) >= 0.f)
+	if(SPRING_WALL_UQ <= SPRING_UQ_MAX || SPRING_WALL_BLEND_RAD <= 0.f)
+		return false;
+	if(SPRING_WALL_D < SPRING_D)
+		return false;
+	// At π: mid envelope between soft max and wall.
+	int32_t at_pi = (int32_t)(pi / RAD_PER_COUNT);
+	float u_pi = spring_uq(at_pi, 0.f, SPRING_K);
+	float mid_env = 0.5f * (SPRING_UQ_MAX + SPRING_WALL_UQ);
+	if(fabsf(u_pi - mid_env) > 0.05f)
 		return false;
 	float v = SPRING_VEL_ALPHA * RAD_PER_COUNT * (float)PWM_HZ;
-	float u10 = SPRING_K * (10.f * 3.14159265f / 180.f);
+	float u10 = SPRING_K * (10.f * pi / 180.f);
 	if(SPRING_D * v >= u10 * 0.5f)
 		return false;
 	if(SPRING_UQ_MAX <= DIR_PULSE_UQ)
@@ -263,26 +294,27 @@ static float spin_uq(float vel) {
 		return 0.f;
 	float signv = vel < 0.f ? -1.f : 1.f;
 	float over = absv - SPIN_W_MAX;
-	if(over < 0.f)
-		over = 0.f;
-	float u = (SPIN_KV - SPIN_B) * vel - SPIN_B_CAP * over * signv;
+	// Soft ramp just above rest so FF doesn't cliff-edge into detent hunting.
+	float ramp = clampf((absv - SPIN_W_REST) / SPIN_W_REST, 0.f, 1.f);
+	float u = (SPIN_KV - SPIN_B) * vel * ramp;
+	if(over > 0.f)
+		u -= signv * clampf(over / SPIN_W_MAX, 0.f, 1.f) * SPIN_B_CAP;
 	return clampf(u, -SPIN_UQ_MAX, SPIN_UQ_MAX);
 }
-
-// (spin_iq_cmd removed — SPIN stays voltage flywheel even with CUR_LOOP_CTRL)
 
 static bool spin_selfcheck(void) {
 	if(spin_uq(0.f) != 0.f)
 		return false;
 	if(spin_uq(SPIN_W_REST * 0.5f) != 0.f)
 		return false;
-	if(SPIN_B <= 0.f || SPIN_B >= SPIN_KV)
+	if(SPIN_KV <= 0.f)
 		return false;
-	float net = SPIN_KV - SPIN_B;
-	if(net >= 0.025f)
+	if(SPIN_B < 0.f || SPIN_B >= SPIN_KV)
 		return false;
 	if(spin_uq(2.f) <= 0.f || spin_uq(-2.f) >= 0.f)
 		return false;
+	if(spin_uq(SPIN_W_MAX + 20.f) >= spin_uq(SPIN_W_MAX * 0.5f))
+		return false; // soft cap must reduce drive vs mid-band
 	if(SPIN_W_MAX <= SPIN_W_REST)
 		return false;
 	return true;
@@ -328,6 +360,7 @@ void motor_set_duty(float a, float b, float c) {
 static void motor_brake_low(void) {
 	ud_cmd = 0.f;
 	uq_cmd = 0.f;
+	uq_ff_cmd = 0.f;
 	forced_te = 0.f;
 	te_from_encoder = false;
 	cur_pi_reset();
@@ -354,6 +387,8 @@ void motor_get_state(motor_state_t* s) {
 	s->vbus_v = vbus;
 	s->ud_out = ud_hold;
 	s->uq_out = uq_hold;
+	s->cog_en = cog_en;
+	s->aligned = aligned;
 }
 
 void motor_set_spring_k(float k) {
@@ -366,6 +401,7 @@ void motor_set_spring_k(float k) {
 
 void motor_set_rest_to_current(void) {
 	rest_pos = pos;
+	rest_hold = true;
 }
 
 float motor_get_spring_k(void) {
@@ -400,14 +436,11 @@ static void sincos_lut(float te, float* s_out, float* c_out) {
 
 static void apply_voltage(float ud, float uq, float te) {
 	float mag2 = ud * ud + uq * uq;
-#if !(CUR_LOOP_EN && CUR_LOOP_CTRL)
-	if(mode == MOTOR_SPIN) {
-		if(mag2 < 1.0e-12f) {
-			motor_set_duty(0.5f, 0.5f, 0.5f);
-			return;
-		}
-	} else
-#endif
+	// SPIN coast: true 50% when command≈0 (also when CUR_LOOP_CTRL=1).
+	if(mode == MOTOR_SPIN && mag2 < 1.0e-8f) {
+		motor_set_duty(0.5f, 0.5f, 0.5f);
+		return;
+	}
 	if(mag2 < PWM_MIN_MAG2) {
 		motor_set_duty(0.5f, 0.5f, 0.5f);
 		return;
@@ -443,10 +476,9 @@ static void sense_park(float te) {
 	iq_meas += a * (iq - iq_meas);
 }
 
-// Park/PI in (te+CS_TE_OFF); SVPWM in align te. TE_OFF was tuned so Iq@θ+φ tracks Uq@θ —
-// applying u at θ+φ breaks that plant (GOTO regress). Ceiling: residual φ mix on Iq≈0.
+// Park/PI in (te+CS_TE_OFF). SVPWM uses align te except SPIN (same frame for Iq=0 freewheel).
 #if CUR_LOOP_CTRL
-static void apply_current_svpwm(float te, float id_ref, float iq_ref) {
+static void apply_current_svpwm(float te, float id_ref, float iq_ref, float uq_ff) {
 	float te_i = te + CS_TE_OFF;
 	float s, c;
 	sincos_lut(te_i, &s, &c);
@@ -465,11 +497,13 @@ static void apply_current_svpwm(float te, float id_ref, float iq_ref) {
 	id_i = clampf(id_i + CUR_KI * ed * CUR_DT_S, -CUR_U_MAX, CUR_U_MAX);
 	iq_i = clampf(iq_i + CUR_KI * eq * CUR_DT_S, -CUR_U_MAX, CUR_U_MAX);
 	float ud = clampf(CUR_KP * ed + id_i, -CUR_U_MAX, CUR_U_MAX);
-	float uq = clampf(CUR_KP * eq + iq_i, -CUR_U_MAX, CUR_U_MAX);
+	// ponytail: BEMF FF on uq so Iq=0 coast isn't PI fighting ke·ω (ceiling: KV≈ke).
+	float uq = clampf(CUR_KP * eq + iq_i + uq_ff, -CUR_U_MAX, CUR_U_MAX);
 	ud_hold = ud;
 	uq_hold = uq;
 
-	sincos_lut(te, &s, &c);
+	float te_v = (mode == MOTOR_SPIN) ? te_i : te;
+	sincos_lut(te_v, &s, &c);
 	float mag2 = ud * ud + uq * uq;
 	if(mag2 < PWM_MIN_MAG2) {
 		motor_set_duty(0.5f, 0.5f, 0.5f);
@@ -488,7 +522,8 @@ static void apply_current_svpwm(float te, float id_ref, float iq_ref) {
 }
 
 static void apply_hold_svpwm(float te) {
-	apply_voltage(ud_hold, uq_hold, te);
+	float te_v = (mode == MOTOR_SPIN) ? (te + CS_TE_OFF) : te;
+	apply_voltage(ud_hold, uq_hold, te_v);
 }
 #endif
 #endif
@@ -501,13 +536,24 @@ static void apply_cmd(void) {
 	}
 #if CUR_LOOP_EN
 	if(te_from_encoder) {
-		float uq = (float)dir * uq_cmd;
+		float uq_cmd_ff = uq_cmd;
+		// Skip cog on TEST/POS. On SPRING fade near rest (cog buzz at neutral).
+		if(cog_en && mode != MOTOR_COG_CAL && mode != MOTOR_TEST && mode != MOTOR_POS) {
+			float c = cog_ff(pos);
+			if(mode == MOTOR_SPRING) {
+				float ae = (float)(rest_pos - pos) * RAD_PER_COUNT;
+				if(ae < 0.f)
+					ae = -ae;
+				c *= clampf(ae / SPRING_COG_FADE_RAD, 0.f, 1.f);
+			}
+			uq_cmd_ff += c;
+		}
+		float uq = (float)dir * uq_cmd_ff;
 		float iq_ref = uq * IQ_CMD_A;
 		iq_ref_cached = iq_ref;
-		// SPIN: voltage flywheel (current PI + TE_OFF mix makes cogging worse).
-		bool spin_volt = (mode == MOTOR_SPIN);
 #if CUR_LOOP_CTRL
-		if(!spin_volt) {
+		// Trajectory + SPRING stay voltage (no mid-low busy-wait). Current PI: SPIN/STRESS only.
+		if(mode == MOTOR_SPIN || mode == MOTOR_STRESS) {
 			if(++cur_div >= CUR_LOOP_DIV) {
 				cur_div = 0;
 				sample_phase_currents();
@@ -515,13 +561,18 @@ static void apply_cmd(void) {
 					trip_fault();
 					return;
 				}
-				apply_current_svpwm(te, 0.f, iq_ref);
+				float uq_ff = (mode == MOTOR_SPIN) ? ((float)dir * uq_ff_cmd) : 0.f;
+				apply_current_svpwm(te, 0.f, iq_ref, uq_ff);
 				return;
 			}
 			apply_hold_svpwm(te);
 			return;
 		}
-#endif
+		ud_hold = ud_cmd;
+		uq_hold = uq;
+		apply_voltage(ud_cmd, uq, te);
+		return;
+#else
 		if(++cur_div >= CUR_LOOP_DIV) {
 			cur_div = 0;
 			sample_phase_currents();
@@ -535,11 +586,15 @@ static void apply_cmd(void) {
 		uq_hold = uq;
 		apply_voltage(ud_cmd, uq, te);
 		return;
+#endif
 	}
 	iq_ref_cached = 0.f;
 	apply_voltage(ud_cmd, uq_cmd, te);
 #else
-	float uq = te_from_encoder ? (float)dir * uq_cmd : uq_cmd;
+	float uq_cmd_ff = uq_cmd;
+	if(te_from_encoder && cog_en && mode != MOTOR_COG_CAL)
+		uq_cmd_ff += cog_ff(pos);
+	float uq = te_from_encoder ? (float)dir * uq_cmd_ff : uq_cmd_ff;
 	apply_voltage(ud_cmd, uq, te);
 #endif
 }
@@ -566,6 +621,103 @@ static void stress_advance(uint8_t next) {
 	mode_tick = 0;
 }
 
+static uint32_t cog_bin(int32_t p) {
+	int32_t r = p % (int32_t)COUNTS_PER_REV;
+	if(r < 0)
+		r += (int32_t)COUNTS_PER_REV;
+	return (uint32_t)r * COG_LUT_N / COUNTS_PER_REV;
+}
+
+static float cog_ff(int32_t p) {
+	if(!cog_en)
+		return 0.f;
+	uint32_t i0 = cog_bin(p);
+	uint32_t i1 = i0 + 1u;
+	if(i1 >= COG_LUT_N)
+		i1 = 0;
+	int32_t r = p % (int32_t)COUNTS_PER_REV;
+	if(r < 0)
+		r += (int32_t)COUNTS_PER_REV;
+	uint32_t span = COUNTS_PER_REV / COG_LUT_N;
+	float frac = span ? (float)(r % (int32_t)span) / (float)span : 0.f;
+	return COG_FF_SCALE * (cog_lut[i0] + (cog_lut[i1] - cog_lut[i0]) * frac);
+}
+
+static void cog_load_flash(void) {
+	bool any = false;
+	for(uint32_t i = 0; i < COG_LUT_N; i++) {
+		cog_lut[i] = COG_LUT_FLASH[i];
+		if(cog_lut[i] > 1.0e-6f || cog_lut[i] < -1.0e-6f)
+			any = true;
+	}
+	cog_en = any;
+	cog_ram_override = false;
+}
+
+static void cog_cal_reset(void) {
+	for(uint32_t i = 0; i < COG_LUT_N; i++) {
+		cog_sum[i] = 0.f;
+		cog_cnt[i] = 0;
+	}
+}
+
+static void cog_cal_sample(int32_t p, float uq) {
+	uint32_t i = cog_bin(p);
+	cog_sum[i] += uq;
+	if(cog_cnt[i] < 0xffffu)
+		cog_cnt[i]++;
+}
+
+static void cog_cal_finalize(void) {
+	float mean = 0.f;
+	uint32_t n = 0;
+	for(uint32_t i = 0; i < COG_LUT_N; i++) {
+		if(cog_cnt[i] == 0)
+			continue;
+		cog_lut[i] = cog_sum[i] / (float)cog_cnt[i];
+		mean += cog_lut[i];
+		n++;
+	}
+	if(n == 0) {
+		cog_load_flash();
+		return;
+	}
+	mean /= (float)n;
+	for(uint32_t i = 0; i < COG_LUT_N; i++) {
+		if(cog_cnt[i] == 0) {
+			// ponytail: empty bin ← neighbor; ceiling sparse slow sweep, upgrade = longer CAL.
+			uint32_t j = (i + COG_LUT_N - 1u) % COG_LUT_N;
+			while(cog_cnt[j] == 0 && j != i)
+				j = (j + COG_LUT_N - 1u) % COG_LUT_N;
+			cog_lut[i] = cog_lut[j];
+		}
+		cog_lut[i] -= mean;
+	}
+	cog_en = true;
+	cog_ram_override = true;
+}
+
+static bool cog_selfcheck(void) {
+	if(COG_LUT_N < 8u || (COG_LUT_N & (COG_LUT_N - 1u)) != 0u)
+		return false;
+	if(COUNTS_PER_REV % COG_LUT_N != 0)
+		return false;
+	cog_en = true;
+	cog_lut[0] = 0.1f;
+	for(uint32_t i = 1; i < COG_LUT_N; i++)
+		cog_lut[i] = 0.f;
+	float a = cog_ff(0);
+	float b = cog_ff((int32_t)(COUNTS_PER_REV / COG_LUT_N));
+	cog_en = false;
+	for(uint32_t i = 0; i < COG_LUT_N; i++)
+		cog_lut[i] = 0.f;
+	if(a < 0.05f || a > 0.15f)
+		return false;
+	if(b < -0.01f || b > 0.06f)
+		return false;
+	return true;
+}
+
 static void start_move(int32_t target, uint8_t next) {
 	move_start = pos;
 	move_target = target;
@@ -577,7 +729,8 @@ static bool is_aligning(void) {
 }
 
 static bool follow_move(void) {
-	uint32_t move = ms_to_ticks(TEST_MOVE_MS);
+	uint32_t move_ms = move_ms_override ? move_ms_override : TEST_MOVE_MS;
+	uint32_t move = ms_to_ticks(move_ms);
 	uint32_t hold = ms_to_ticks(TEST_HOLD_MS);
 	if(move == 0)
 		move = 1;
@@ -604,7 +757,11 @@ static bool follow_move(void) {
 	float err = (float)(target - pos) * RAD_PER_COUNT;
 	float omega = (float)span * RAD_PER_COUNT * dsdt * (float)PWM_HZ / (float)move;
 	ud_cmd = 0.f;
-	uq_cmd = clampf(err * POS_KP + TEST_KV * omega, -TEST_UQ_MAX, TEST_UQ_MAX);
+	// Cog cal: position P only — TEST_KV·ω is not cogging and pollutes the LUT.
+	if(mode == MOTOR_COG_CAL)
+		uq_cmd = clampf(err * POS_KP, -TEST_UQ_MAX, TEST_UQ_MAX);
+	else
+		uq_cmd = clampf(err * POS_KP + TEST_KV * omega, -TEST_UQ_MAX, TEST_UQ_MAX);
 	te_from_encoder = true;
 	return mode_tick >= move + hold;
 }
@@ -770,8 +927,25 @@ static void motor_isr(void) {
 			break;
 		}
 		case MOTOR_SPIN: {
+			float vel = vel_update(SPIN_VEL_ALPHA);
 			ud_cmd = 0.f;
-			uq_cmd = spin_uq(vel_update(SPIN_VEL_ALPHA));
+#if CUR_LOOP_EN && CUR_LOOP_CTRL
+			// spin_uq: rest deadband + (KV−B)·ω; Iq_ref=0 (+ soft Iq above W_MAX).
+			uq_ff_cmd = spin_uq(vel);
+			{
+				float absv = vel < 0.f ? -vel : vel;
+				if(absv > SPIN_W_MAX && IQ_CMD_A > 0.f) {
+					float signv = vel < 0.f ? -1.f : 1.f;
+					float over = (absv - SPIN_W_MAX) / SPIN_W_MAX;
+					uq_cmd = -signv * clampf(over, 0.f, 1.f) * (SPIN_IQ_CAP / IQ_CMD_A);
+				} else {
+					uq_cmd = 0.f;
+				}
+			}
+#else
+			uq_ff_cmd = 0.f;
+			uq_cmd = spin_uq(vel);
+#endif
 			te_from_encoder = true;
 			break;
 		}
@@ -843,6 +1017,18 @@ static void motor_isr(void) {
 			}
 			break;
 		}
+		case MOTOR_COG_CAL: {
+			bool done = follow_move();
+			cog_cal_sample(pos, uq_cmd);
+			if(done) {
+				cog_cal_finalize();
+				move_ms_override = 0;
+				motor_brake_low();
+				enter_mode(MOTOR_IDLE);
+				LOG_RAW("cog cal done en=%u\n", (unsigned)cog_en);
+			}
+			break;
+		}
 		default:
 			break;
 	}
@@ -894,7 +1080,9 @@ bool motor_cmd_spring(void) {
 	if(!aligned || mode == MOTOR_FAULT || is_aligning())
 		return false;
 	irq_set_enabled(PWM_IRQ_WRAP, false);
-	rest_pos = pos;
+	if(!rest_hold)
+		rest_pos = pos;
+	rest_hold = false;
 	pos_last = pos;
 	vel_filt = 0.f;
 	cur_pi_reset();
@@ -936,6 +1124,38 @@ bool motor_cmd_stress(void) {
 	enter_mode(MOTOR_STRESS);
 	irq_set_enabled(PWM_IRQ_WRAP, true);
 	return true;
+}
+
+bool motor_cmd_cog_cal(void) {
+	if(!aligned || mode == MOTOR_FAULT || is_aligning())
+		return false;
+	irq_set_enabled(PWM_IRQ_WRAP, false);
+	cog_en = false;
+	cog_cal_reset();
+	move_ms_override = COG_CAL_MS;
+	cur_pi_reset();
+	start_move(pos + (int32_t)COUNTS_PER_REV, MOTOR_COG_CAL);
+	irq_set_enabled(PWM_IRQ_WRAP, true);
+	return true;
+}
+
+void motor_cmd_cog_clear(void) {
+	irq_set_enabled(PWM_IRQ_WRAP, false);
+	if(mode == MOTOR_COG_CAL) {
+		move_ms_override = 0;
+		motor_brake_low();
+		enter_mode(MOTOR_IDLE);
+	}
+	cog_load_flash(); // drop RAM override; restore baked LUT
+	irq_set_enabled(PWM_IRQ_WRAP, true);
+}
+
+void motor_cog_dump(void) {
+	LOG_RAW("cog en=%u ram=%u scale=%.2f\n", (unsigned)cog_en, (unsigned)cog_ram_override,
+			(double)COG_FF_SCALE);
+	for(uint32_t i = 0; i < COG_LUT_N; i++) {
+		LOG_RAW("cog[%u]=%.5f\n", (unsigned)i, (double)cog_lut[i]);
+	}
 }
 
 bool motor_cmd_goto(int32_t angle_mrad) {
@@ -982,6 +1202,9 @@ void motor_setup(void) {
 		LOG_RAW("spring selfcheck FAIL\n");
 	if(!spin_selfcheck())
 		LOG_RAW("spin selfcheck FAIL\n");
+	if(!cog_selfcheck())
+		LOG_RAW("cog selfcheck FAIL\n");
+	cog_load_flash();
 	if(!pos_selfcheck())
 		LOG_RAW("pos selfcheck FAIL\n");
 	if(!stress_selfcheck())
@@ -1047,6 +1270,8 @@ void motor_setup(void) {
 	pwm_clear_irq(pwm_slice_a);
 	pwm_set_irq_enabled(pwm_slice_a, true);
 	irq_set_exclusive_handler(PWM_IRQ_WRAP, pwm_wrap_isr);
+	// Below USB so mid-low busy-wait can be preempted (else Bulk dies even with core1 tud_task).
+	irq_set_priority(PWM_IRQ_WRAP, 0xC0);
 	irq_set_enabled(PWM_IRQ_WRAP, true);
 
 	mt6701_start_read();

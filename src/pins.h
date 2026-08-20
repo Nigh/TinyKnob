@@ -41,19 +41,25 @@
 // 20 kHz raw Δpos is 1ct≈7.7 rad/s — D must see LPF'd vel. Ceiling: lag on fast flicks; upgrade = encoder PLL.
 #define SPRING_K 0.6f
 #define SPRING_D 0.05f
-#define SPRING_UQ_MAX 0.35f
+#define SPRING_UQ_MAX 0.35f /* soft effort envelope inside blend */
+#define SPRING_WALL_UQ 0.85f /* effort envelope past ±π blend (same sign as K·err) */
+#define SPRING_WALL_BLEND_RAD 0.45f /* soft↔wall envelope over ±π (±~26°) */
+#define SPRING_WALL_D 0.15f /* damping at full wall; lerped in blend */
+#define SPRING_COG_FADE_RAD 0.35f /* fade cog FF near rest */
 #define SPRING_VEL_LP_HZ 50.f
 // ponytail: CUR_LOOP_EN=1 enables CSA sample+Park telem. CUR_LOOP_CTRL=1 also closes Id/Iq PI.
 // CTRL=0 = sense-only (voltage outer loops; use to inspect Id/Iq without shake).
 #define CUR_LOOP_EN 1
 #define CUR_LOOP_CTRL 1
-#define CUR_LOOP_DIV 4u
-// SPIN: always voltage flywheel (SPIN_KV/B + cap). Other modes use current loop when CTRL=1.
-#define SPIN_KV 0.020f
-#define SPIN_B 0.002f
-#define SPIN_W_REST 0.10f
-#define SPIN_W_MAX 25.f
-#define SPIN_B_CAP 0.08f
+#define CUR_LOOP_DIV 4u /* current PI rate for SPIN/STRESS only */
+// SPIN + CUR_LOOP_CTRL: Iq_ref=0 + spin_uq BEMF FF (soft rest + SPIN_B) + cog FF when LUT≠0.
+// CTRL=0: open-loop spin_uq (KV>ke self-spins — avoid).
+#define SPIN_KV 0.018f /* coast vs creep; with B>0 net FF = KV−B */
+#define SPIN_B 0.008f  /* vel damp on FF — kills touch-shake; keep < KV */
+#define SPIN_W_REST 0.35f /* soft FF ramp starts here; wider → less detent hunting */
+#define SPIN_W_MAX 45.f
+#define SPIN_B_CAP 0.30f
+#define SPIN_IQ_CAP 0.20f /* opposing Iq (A) when |ω|>SPIN_W_MAX under current loop */
 #define SPIN_UQ_MAX 0.50f
 #define SPIN_VEL_LP_HZ 120.f
 // Stress: +full 3s / coast 1s / -full 3s / coast 1s; Uq smoothstep on start & stop.
@@ -80,5 +86,10 @@
 #define CUR_KP 0.25f
 #define CUR_KI 400.f
 #define CUR_U_MAX 0.95f
+
+// Cogging FF: flash default (cog_lut_default.h) + RAM override after COGCAL / host-learn.
+#define COG_LUT_N 64u
+#define COG_CAL_MS 8000u
+#define COG_FF_SCALE 1.0f /* 2.0 felt mushy/heavy; raise only after a clean host-learn */
 
 #endif

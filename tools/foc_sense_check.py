@@ -145,7 +145,7 @@ def collect_sweep(dev, a0: int, revs: float, seconds: float) -> list[dict]:
 	return rows
 
 
-def analyze(rows: list[dict], revs: float) -> int:
+def analyze(rows: list[dict], revs: float, closed: bool) -> int:
 	"""Return process exit code 0=ok-ish, 1=needs tuning, 2=bad data."""
 	if len(rows) < 80:
 		print(f"FAIL: too few samples ({len(rows)})")
@@ -164,10 +164,9 @@ def analyze(rows: list[dict], revs: float) -> int:
 	seq_gaps = int(np.sum(dseq > 2))
 
 	mech_span = (ang[-1] - ang[0]) / (2.0 * np.pi)
-	# Closed loop: Uq is PI output (can be small); prefer |Iq_ref| mask when active.
+	# Closed loop: Uq is PI output (can be small); prefer |Iq_ref| mask when requested.
 	mask_ref = np.abs(iq_ref) > 0.05
 	mask_uq = np.abs(uq) > 0.05
-	closed = int(mask_ref.sum()) >= 40
 	mask = mask_ref if closed else mask_uq
 	if int(mask.sum()) < 40:
 		print("FAIL: too few samples with |Uq| or |Iq_ref|>0.05 (motor not tracking?)")
@@ -242,7 +241,7 @@ def analyze(rows: list[dict], revs: float) -> int:
 		rc = 0
 	elif (not closed) and same >= 90.0 and ratio < 0.35:
 		if flips_per_rev < POLE_PAIRS * 0.25:
-			print("OK: sense frame looks usable (keep CUR_LOOP_CTRL=0 until DMA sample)")
+			print("OK: synchronized sense frame looks usable (keep CUR_LOOP_CTRL=0 until PI retuning)")
 			rc = 0
 		else:
 			print("OK-ish: sign/ratio good; flips still noisy (small |Iq|) — stay on voltage outer")
@@ -259,6 +258,11 @@ def main() -> int:
 	ap.add_argument("--seconds", type=float, default=4.0, help="sweep duration")
 	ap.add_argument("--save", type=str, default="", help="optional .npz path")
 	ap.add_argument("--skip-start", action="store_true", help="assume already aligned/IDLE")
+	ap.add_argument(
+		"--closed-loop",
+		action="store_true",
+		help="analyze Iq_ref PI tracking (firmware CUR_LOOP_CTRL=1); default is sense-only",
+	)
 	ap.add_argument(
 		"--no-bootloader",
 		action="store_true",
@@ -304,7 +308,7 @@ def main() -> int:
 		)
 		print(f"saved {args.save}")
 
-	rc = analyze(rows, args.revs)
+	rc = analyze(rows, args.revs, args.closed_loop)
 
 	if not args.no_bootloader:
 		print("UPLOAD → UF2 bootloader...")

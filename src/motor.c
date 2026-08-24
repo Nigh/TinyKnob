@@ -94,6 +94,7 @@ static volatile float duty_a_cached;
 static volatile float duty_b_cached;
 static volatile float duty_c_cached;
 static volatile int32_t track_pos;
+static volatile float track_vel_ref;
 static bool enc_ok_this;
 
 static float v_off_a, v_off_b, v_off_c;
@@ -104,7 +105,8 @@ static float iq_ref_cached;
 static float vbus = 12.f;
 static float id_i, iq_i;
 static float ud_hold, uq_hold;
-static float uq_ff_cmd; /* SPIN BEMF FF (pre-dir); 0 elsewhere */
+static float uq_ff_cmd; /* SPIN BEMF FF during current-brake region; 0 elsewhere */
+static bool spin_current_active;
 static uint8_t cur_div;
 static uint32_t move_ms_override; // 0 → TEST_MOVE_MS
 static float cog_lut[COG_LUT_N];
@@ -112,6 +114,8 @@ static float cog_sum[COG_LUT_N];
 static uint16_t cog_cnt[COG_LUT_N];
 static bool cog_en;
 static bool cog_ram_override; // true after COGCAL until COGCLEAR restores flash
+static volatile float spin_cog_scale = SPIN_COG_FF_SCALE;
+static volatile float spring_cog_scale = SPRING_COG_FF_SCALE;
 
 static void trip_fault(void);
 static bool overcurrent(void);
@@ -317,7 +321,7 @@ static float vel_update(float alpha) {
 	return vel_filt;
 }
 
-static float spin_uq(float vel) {
+static float spin_voltage_ff(float vel) {
 	float absv = vel < 0.f ? -vel : vel;
 	if(absv < SPIN_W_REST)
 		return 0.f;
@@ -331,19 +335,33 @@ static float spin_uq(float vel) {
 	return clampf(u, -SPIN_UQ_MAX, SPIN_UQ_MAX);
 }
 
+static float spin_iq_ref(float vel) {
+	float absv = vel < 0.f ? -vel : vel;
+	if(absv <= SPIN_W_MAX)
+		return 0.f;
+	float signv = vel < 0.f ? -1.f : 1.f;
+	float over = (absv - SPIN_W_MAX) / SPIN_W_MAX;
+	return -signv * clampf(over, 0.f, 1.f) * SPIN_IQ_CAP;
+}
+
 static bool spin_selfcheck(void) {
-	if(spin_uq(0.f) != 0.f)
+	if(spin_voltage_ff(0.f) != 0.f || spin_iq_ref(0.f) != 0.f)
 		return false;
-	if(spin_uq(SPIN_W_REST * 0.5f) != 0.f)
+	if(spin_voltage_ff(SPIN_W_REST * 0.5f) != 0.f)
 		return false;
 	if(SPIN_KV <= 0.f)
 		return false;
 	if(SPIN_B < 0.f || SPIN_B >= SPIN_KV)
 		return false;
-	if(spin_uq(2.f) <= 0.f || spin_uq(-2.f) >= 0.f)
+	if(spin_voltage_ff(2.f) <= 0.f || spin_voltage_ff(-2.f) >= 0.f)
 		return false;
-	if(spin_uq(SPIN_W_MAX + 20.f) >= spin_uq(SPIN_W_MAX * 0.5f))
+	if(spin_voltage_ff(SPIN_W_MAX + 20.f) >= spin_voltage_ff(SPIN_W_MAX * 0.5f))
 		return false; // soft cap must reduce drive vs mid-band
+	if(spin_iq_ref(SPIN_W_MAX) != 0.f || spin_iq_ref(SPIN_W_MAX * 2.f) >= 0.f ||
+			spin_iq_ref(-SPIN_W_MAX * 2.f) <= 0.f)
+		return false;
+	if(fabsf(spin_iq_ref(SPIN_W_MAX * 2.f)) > SPIN_IQ_CAP)
+		return false;
 	if(SPIN_W_MAX <= SPIN_W_REST)
 		return false;
 	return true;
@@ -687,7 +705,7 @@ static void apply_cmd(void) {
 		// Host LUT is learned in amperes; SPRING outer command is normalized then
 		// scaled by SPRING_IQ_CMD_A. Start at half cancellation to avoid overcompensation.
 		if(cog_en && mode != MOTOR_COG_CAL && mode != MOTOR_TEST &&
-				mode != MOTOR_POS && mode != MOTOR_SPRING) {
+				mode != MOTOR_POS) {
 			float c = cog_ff(pos);
 			uq_cmd_ff += c;
 		}
@@ -701,11 +719,8 @@ static void apply_cmd(void) {
 		csa_te_active = te;
 		csa_te_valid = true;
 #if CUR_LOOP_CTRL
-#if CUR_LOOP_TEST_ONLY
-		bool use_current = mode == MOTOR_TEST || mode == MOTOR_POS;
-#else
-		bool use_current = mode != MOTOR_COG_CAL && mode != MOTOR_STRESS;
-#endif
+		bool use_current = mode == MOTOR_TEST || mode == MOTOR_POS ||
+				(mode == MOTOR_SPIN && spin_current_active);
 		// ponytail: SPRING stays voltage-driven until a current-domain outer loop is
 		// validated without mode switching, integral bias, or an ampere-domain LUT.
 		if(mode == MOTOR_SPRING)
@@ -738,7 +753,7 @@ static void apply_cmd(void) {
 	apply_voltage(ud_cmd, uq_cmd, te);
 #else
 	float uq_cmd_ff = uq_cmd;
-	if(te_from_encoder && cog_en && mode != MOTOR_COG_CAL && mode != MOTOR_SPRING)
+	if(te_from_encoder && cog_en && mode != MOTOR_COG_CAL)
 		uq_cmd_ff += cog_ff(pos);
 	float uq = te_from_encoder ? (float)dir * uq_cmd_ff : uq_cmd_ff;
 	apply_voltage(ud_cmd, uq, te);
@@ -786,7 +801,8 @@ static float cog_ff(int32_t p) {
 		r += (int32_t)COUNTS_PER_REV;
 	uint32_t span = COUNTS_PER_REV / COG_LUT_N;
 	float frac = span ? (float)(r % (int32_t)span) / (float)span : 0.f;
-	return COG_FF_SCALE * (cog_lut[i0] + (cog_lut[i1] - cog_lut[i0]) * frac);
+	float scale = mode == MOTOR_SPRING ? spring_cog_scale : spin_cog_scale;
+	return scale * (cog_lut[i0] + (cog_lut[i1] - cog_lut[i0]) * frac);
 }
 
 static void cog_load_flash(void) {
@@ -1072,8 +1088,9 @@ static void motor_isr(void) {
 		case MOTOR_POS: {
 			float err = (float)(track_pos - pos) * RAD_PER_COUNT;
 			float vel = vel_update(SPRING_VEL_ALPHA);
+			float vel_ref = track_vel_ref;
 			ud_cmd = 0.f;
-			uq_cmd = clampf(err * POS_KP - POS_D * vel, -TEST_UQ_MAX, TEST_UQ_MAX);
+			uq_cmd = clampf(err * POS_KP + POS_D * (vel_ref - vel), -TEST_UQ_MAX, TEST_UQ_MAX);
 			te_from_encoder = true;
 			break;
 		}
@@ -1102,21 +1119,22 @@ static void motor_isr(void) {
 			float vel = vel_update(SPIN_VEL_ALPHA);
 			ud_cmd = 0.f;
 #if CUR_LOOP_EN && CUR_LOOP_CTRL
-			// spin_uq: rest deadband + (KV−B)·ω; Iq_ref=0 (+ soft Iq above W_MAX).
-			uq_ff_cmd = spin_uq(vel);
-			{
-				float absv = vel < 0.f ? -vel : vel;
-				if(absv > SPIN_W_MAX && IQ_CMD_A > 0.f) {
-					float signv = vel < 0.f ? -1.f : 1.f;
-					float over = (absv - SPIN_W_MAX) / SPIN_W_MAX;
-					uq_cmd = -signv * clampf(over, 0.f, 1.f) * (SPIN_IQ_CAP / IQ_CMD_A);
-				} else {
-					uq_cmd = 0.f;
-				}
+			float brake_iq = spin_iq_ref(vel);
+			spin_current_active = brake_iq != 0.f;
+			if(spin_current_active) {
+				// Above the speed ceiling, PI provides a bounded braking torque.
+				uq_ff_cmd = spin_voltage_ff(vel);
+				uq_cmd = IQ_CMD_A > 0.f ? brake_iq / IQ_CMD_A : 0.f;
+			} else {
+				// Normal free-spin deliberately bypasses zero-current PI: inaccurate
+				// current feedback otherwise feels like strong electrical damping.
+				uq_ff_cmd = 0.f;
+				uq_cmd = spin_voltage_ff(vel);
 			}
 #else
+			spin_current_active = false;
 			uq_ff_cmd = 0.f;
-			uq_cmd = spin_uq(vel);
+			uq_cmd = spin_voltage_ff(vel);
 #endif
 			te_from_encoder = true;
 			break;
@@ -1325,20 +1343,39 @@ void motor_cmd_cog_clear(void) {
 	irq_set_enabled(PWM_IRQ_WRAP, true);
 }
 
+bool motor_set_cog_scale(float scale) {
+	if(scale < 0.f)
+		scale = 0.f;
+	if(scale > 2.f)
+		scale = 2.f;
+	if(mode == MOTOR_SPRING)
+		spring_cog_scale = scale;
+	else if(mode == MOTOR_SPIN)
+		spin_cog_scale = scale;
+	else
+		return false;
+	return true;
+}
+
+float motor_get_cog_scale(uint8_t query_mode) {
+	return query_mode == MOTOR_SPRING ? spring_cog_scale : spin_cog_scale;
+}
+
 void motor_cog_dump(void) {
 	LOG_RAW("cog en=%u ram=%u scale=%.2f\n", (unsigned)cog_en, (unsigned)cog_ram_override,
-			(double)COG_FF_SCALE);
+			(double)motor_get_cog_scale(mode));
 	for(uint32_t i = 0; i < COG_LUT_N; i++) {
 		LOG_RAW("cog[%u]=%.5f\n", (unsigned)i, (double)cog_lut[i]);
 	}
 }
 
-bool motor_cmd_goto(int32_t angle_mrad) {
+bool motor_cmd_goto_vel(int32_t angle_mrad, int32_t velocity_mrad_s) {
 	if(!aligned || mode == MOTOR_FAULT || is_aligning())
 		return false;
 	int32_t target = (int32_t)((float)angle_mrad / (RAD_PER_COUNT * 1000.f));
 	irq_set_enabled(PWM_IRQ_WRAP, false);
 	track_pos = target;
+	track_vel_ref = (float)velocity_mrad_s / 1000.f;
 	if(mode != MOTOR_POS) {
 		pos_last = pos;
 		vel_filt = 0.f;
@@ -1347,6 +1384,10 @@ bool motor_cmd_goto(int32_t angle_mrad) {
 	}
 	irq_set_enabled(PWM_IRQ_WRAP, true);
 	return true;
+}
+
+bool motor_cmd_goto(int32_t angle_mrad) {
+	return motor_cmd_goto_vel(angle_mrad, 0);
 }
 
 static bool pos_selfcheck(void) {

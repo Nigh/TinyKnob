@@ -32,7 +32,7 @@ except ImportError:
 VID, PID = 0xACDC, 0x4011
 EP_OUT, EP_IN = 0x01, 0x81
 TELEM_FMT = "<BBi3hHhhhHh"
-COG_LUT_N = 64
+COG_LUT_N = 512
 COUNTS_PER_REV = 16384
 MRAD_2PI = 6283
 COG_CAL_S = 10.0
@@ -220,8 +220,8 @@ def host_learn(dev, seconds: float, revs: float, invert: bool = False) -> np.nda
 	print(f"bins filled={int(filled.sum())}/{COG_LUT_N}  |lut|peak={float(np.max(np.abs(lut))):.4f} invert={invert}")
 	n_fill = int(filled.sum())
 	peak = float(np.max(np.abs(lut)))
-	if n_fill < 56:
-		raise SystemExit(f"host-learn: sparse LUT ({n_fill}/64 filled; need ≥56) — raise --seconds/--revs")
+	if n_fill < int(COG_LUT_N * 0.9):
+		raise SystemExit(f"host-learn: sparse LUT ({n_fill}/{COG_LUT_N} filled; need ≥90%) — raise --seconds/--revs")
 	if peak <= 1e-3:
 		raise SystemExit(f"host-learn: |peak|={peak:.6f} too small — check GOTO effort / CUR_LOOP")
 	return lut.astype(np.float64)

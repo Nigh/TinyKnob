@@ -13,6 +13,8 @@ void serial_receive(uint8_t const* buffer, uint16_t bufsize);
 
 #define TELEM_MAGIC 0xA5
 #define ACK_MAGIC 0x5A
+#define MODE_SCALE_MAGIC 0x5B
+#define MODE_SCALE_EVENT 0x01
 #define TELEM_PERIOD_US 1000u /* ~1 kHz */
 
 //--------------------------------------------------------------------+
@@ -20,6 +22,8 @@ void serial_receive(uint8_t const* buffer, uint16_t bufsize);
 //--------------------------------------------------------------------+
 
 #define CDC_LOG_RING 1024u
+
+static uint8_t vendor_reported_mode = 0xffu;
 
 static uint8_t log_ring[CDC_LOG_RING];
 static volatile uint16_t log_w;
@@ -127,6 +131,7 @@ void cdc_log_print_wait(char* str) {
 
 void tud_mount_cb(void) {
 	usb_mounted = true;
+	vendor_reported_mode = 0xffu;
 }
 
 void tud_umount_cb(void) {
@@ -164,6 +169,20 @@ static void vendor_send_ack(uint8_t cmd, uint8_t status) {
 	uint8_t ack[3] = {ACK_MAGIC, cmd, status};
 	tud_vendor_n_write(0, ack, 3);
 	tud_vendor_n_write_flush(0);
+}
+
+static bool vendor_send_mode_scale(uint8_t mode) {
+	if(!usb_mounted || !tud_vendor_n_mounted(0))
+		return false;
+	if(tud_vendor_n_write_available(0) < 5)
+		return false;
+	float scale = motor_get_cog_scale(mode);
+	uint16_t milli = (uint16_t)(scale * 1000.f + 0.5f);
+	uint8_t pkt[5] = {MODE_SCALE_MAGIC, MODE_SCALE_EVENT, mode,
+			(uint8_t)milli, (uint8_t)(milli >> 8)};
+	tud_vendor_n_write(0, pkt, sizeof(pkt));
+	tud_vendor_n_write_flush(0);
+	return true;
 }
 
 static int16_t amp_to_ma(float a) {
@@ -205,7 +224,9 @@ static void vendor_send_telem(void) {
 		uq = -1.f;
 	int16_t uq_q15 = (int16_t)(uq * 32767.f);
 
-	uint8_t pkt[24];
+	// Keep the original 24-byte prefix stable. The appended direction lets
+	// calibration normalize post-dir Iq_ref back into the command domain.
+	uint8_t pkt[25];
 	pkt[0] = TELEM_MAGIC;
 	pkt[1] = st.mode;
 	pkt[2] = (uint8_t)st.angle_mrad;
@@ -230,9 +251,10 @@ static void vendor_send_telem(void) {
 	pkt[21] = (uint8_t)(vbus_mv >> 8);
 	pkt[22] = (uint8_t)uq_q15;
 	pkt[23] = (uint8_t)(uq_q15 >> 8);
+	pkt[24] = (uint8_t)st.dir;
 	seq++;
 
-	tud_vendor_n_write(0, pkt, 24);
+	tud_vendor_n_write(0, pkt, sizeof(pkt));
 	tud_vendor_n_write_flush(0);
 }
 
@@ -251,6 +273,17 @@ void vendor_task(void) {
 			if(!(buf[0] == 0x06 && rc == 1))
 				vendor_send_ack(buf[0], (uint8_t)rc);
 		}
+	}
+
+	motor_state_t mode_state;
+	motor_get_state(&mode_state);
+	if(mode_state.mode != vendor_reported_mode) {
+		if(mode_state.mode == MOTOR_SPRING || mode_state.mode == MOTOR_SPIN) {
+			if(vendor_send_mode_scale(mode_state.mode))
+				vendor_reported_mode = mode_state.mode;
+			return;
+		}
+		vendor_reported_mode = mode_state.mode;
 	}
 
 	static uint32_t last_us;

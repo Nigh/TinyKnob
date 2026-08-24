@@ -43,7 +43,7 @@ On Linux with libusb, prefer matching by VID/PID then selecting the interface wi
 
 ## Telemetry stream (device → host, Bulk IN)
 
-The device pushes fixed **24-byte** frames at about **1 kHz** when the host keeps Bulk IN outstanding and the bus is free. Do not assume a hard realtime guarantee.
+The device pushes fixed **25-byte** frames at about **1 kHz** when the host keeps Bulk IN outstanding and the bus is free. Do not assume a hard realtime guarantee.
 
 ### Frame layout
 
@@ -61,8 +61,9 @@ The device pushes fixed **24-byte** frames at about **1 kHz** when the host keep
 | 18–19 | `i16` | `iq_ref_mA` | Iq reference (milliamps) |
 | 20–21 | `u16` | `vbus_mV` | Bus voltage from 0.1×VCC sense (millivolts) |
 | 22–23 | `i16` | `uq_q15` | Current-loop Uq output (normalized, Q15; 32767 ≈ full) |
+| 24 | `i8` | `dir` | Motor/encoder direction (`-1` or `+1`); use it to normalize `iq_ref_mA` to the pre-direction command domain |
 
-Total size: **24 bytes**. Bytes 0–13 match the previous 16-byte frame prefix (reserved was replaced).
+Total size: **25 bytes**. The first 24 bytes remain backward-compatible. Bytes 0–13 match the previous 16-byte frame prefix (reserved was replaced).
 
 ### Units
 
@@ -83,7 +84,7 @@ Total size: **24 bytes**. Bytes 0–13 match the previous 16-byte frame prefix (
 | 4 | `MOTOR_ALIGN_DOWN` | Align ramp down |
 | 5 | `MOTOR_TEST` | ±360° test move |
 | 6 | `MOTOR_SPRING` | Virtual spring inside ±π; hard wall beyond ±π (no wrap-through) |
-| 7 | `MOTOR_SPIN` | Coast / voltage `spin_uq` (+ cog FF) |
+| 7 | `MOTOR_SPIN` | Low-damping voltage feed-forward and cog compensation; current PI for capped overspeed braking |
 | 8 | `MOTOR_FAULT` | Fault (CRC etc.); brake |
 | 9 | `MOTOR_POS` | Track absolute angle (streaming setpoint) |
 | 10 | `MOTOR_STRESS` | Burn-in: +full / stop / −full / stop with smooth Uq ramps |
@@ -100,17 +101,18 @@ Each command is one Bulk OUT transfer. Byte 0 is the opcode; payload follows imm
 | `0x03` | `SPRING` | none | Enter spring (needs prior align) |
 | `0x04` | `SPIN` | none | Enter spin (needs prior align) |
 | `0x05` | `TEST` | none | Enter TEST (needs prior align) |
-| `0x06` | `GOTO` | `i32 angle_mrad` (LE) | Enter/stay in `MOTOR_POS` and set tracking target (needs prior align) |
+| `0x06` | `GOTO` | `i32 angle_mrad` (LE), optional `i32 velocity_mrad_s` (LE) | Enter/stay in `MOTOR_POS` and set tracking target (needs prior align) |
 | `0x07` | `STRESS` | none | Enter burn-in loop (needs prior align): +full 3s, stop 1s, −full 3s, stop 1s; 500ms smoothstep Uq on start/stop |
 | `0x08` | `COG_CAL` | none | Slow +1 rev position track; fill cogging FF LUT (needs prior align). ~`COG_CAL_MS` then IDLE with FF on |
 | `0x09` | `COG_CLEAR` | none | Disable cogging FF and zero the LUT |
 | `0x20` | `SET_K` | `u8 k_x10` | Spring stiffness `K = k_x10 / 10` (clamped 0…8) |
 | `0x21` | `SET_REST` | none | Set spring rest angle to current position |
+| `0x22` | `SET_COG_SCALE` | `u16 scale_x1000` (LE) | Set the current SPRING or SPIN scale to `scale_x1000 / 1000`, clamped to 0…2; RAM only |
 | `0x7F` | `UPLOAD` | none | Reboot into UF2 bootloader (same as CDC `UPLOAD`) |
 
 ### GOTO / tracking details
 
-- Payload uses the same unit as telemetry `angle_mrad` (unwrapped mechanical milliradians).
+- The required position uses the same unit as telemetry `angle_mrad` (unwrapped mechanical milliradians). An optional velocity field enables target-velocity feed-forward; omitted means zero for backward compatibility.
 - Example: `+π` rad ≈ `3142` mrad → bytes `06 4E 0C 00 00` (`0x06` + LE `0x00000C4E`).
 - **Tracking mode** (not a timed trajectory): each PWM tick (~20 kHz) applies P+D toward the latest target. Safe to stream at **hundreds of Hz to ~1 kHz** from the host to follow a simulated wheel.
 - First accepted `GOTO` enters `MOTOR_POS`; later `GOTO`s only update the setpoint (no mode restart).
@@ -127,13 +129,26 @@ After a command, the device may write a 3-byte packet on Bulk IN:
 | 1 | `u8` | echoed `cmd` |
 | 2 | `u8` | `status`: `1` = ok, `0` = rejected (e.g. SPRING/SPIN/TEST/GOTO before align, or `GOTO` with short payload) |
 
-Hosts **may ignore** ACKs. Distinguish from telemetry by `magic`: `0xA5` = telem, `0x5A` = ack. If a read returns a length other than 24, or magic is `0x5A`, treat as ack (or skip).
+Hosts **may ignore** ACKs. A mode-scale event uses magic `0x5B` and must not be parsed as telemetry. Distinguish from telemetry by `magic`: `0xA5` = telem, `0x5A` = ack. Use the magic byte to distinguish packets; telemetry is currently 25 bytes and its original 24-byte prefix is stable.
 
 Exception: successful `GOTO` (`0x06`, `status` would be 1) sends **no** ACK. `UPLOAD` (`0x7F`) also sends **no** ACK — the device reboots into bootrom before a reply can go out.
 
+### Mode COG-scale event
+
+On USB mount and whenever the device enters SPRING or SPIN, Bulk IN sends a 5-byte packet so the host can synchronize its control:
+
+| Offset | Type | Meaning |
+|--------|------|---------|
+| 0 | `u8` | magic `0x5B` |
+| 1 | `u8` | event `0x01` = mode COG scale |
+| 2 | `u8` | mode (`6` = SPRING, `7` = SPIN) |
+| 3 | `u16` LE | current mode scale × 1000 |
+
+SPRING and SPIN keep independent RAM values. They initialize from the compiled `SPRING_COG_FF_SCALE` and `SPIN_COG_FF_SCALE` defaults; `SET_COG_SCALE` modifies only the currently active feel mode.
+
 ### Failure semantics
 
-- `START` / `STOP` / `SET_K` / `SET_REST` always succeed at the protocol layer (`status=1`).
+- `START` / `STOP` / `SET_K` / `SET_REST` always succeed at the protocol layer (`status=1`). `SET_COG_SCALE` succeeds with a 2-byte payload while in SPRING or SPIN; it returns `status=0` for a short payload or any other mode.
 - `SPRING` / `SPIN` / `TEST` / `STRESS` / `GOTO` return `status=0` if the motor is not aligned/armed yet (same as CDC `need START`), or if `GOTO` payload is fewer than 4 bytes. Successful `GOTO` skips ACK entirely.
 - `UPLOAD` reboots into UF2; no ACK. Host should wait for the device to reappear as a mass-storage / picoboot target.
 - Unknown `cmd`: no ACK; ignored.
@@ -184,6 +199,7 @@ def read_telem():
         "iq_ref_A": iq_ref_ma / 1000.0,
         "vbus_V": vbus_mv / 1000.0,
         "uq": uq_q15 / 32767.0,
+        "dir": struct.unpack_from("<b", data, 24)[0] if len(data) >= 25 else None,
     }
 
 send_cmd(0x01)           # START
@@ -218,7 +234,8 @@ typedef struct __attribute__((packed)) {
 	int16_t  iq_ref_mA;
 	uint16_t vbus_mV;
 	int16_t  uq_q15;      /* current-loop Uq, Q15 */
-} tinyknob_telem_t; /* 24 bytes */
+	int8_t   dir;         /* motor/encoder direction: -1 or +1 */
+} tinyknob_telem_t; /* 25 bytes */
 
 typedef struct __attribute__((packed)) {
 	uint8_t magic;  /* 0x5A */
@@ -240,6 +257,7 @@ enum {
 	TK_CMD_STRESS   = 0x07,
 	TK_CMD_SET_K    = 0x20,
 	TK_CMD_SET_REST = 0x21,
+	TK_CMD_SET_COG_SCALE = 0x22,
 	TK_CMD_UPLOAD   = 0x7F,
 };
 ```

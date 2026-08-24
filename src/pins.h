@@ -1,7 +1,7 @@
 #ifndef _PINS_H_
 #define _PINS_H_
 
-// RP2040-Zero — TinyKnob
+// Waveshare RP2350-Zero — TinyKnob
 
 #define PIN_PWM_A 2
 #define PIN_PWM_B 4
@@ -47,13 +47,12 @@
 #define SPRING_WALL_D 0.15f /* damping at full wall; lerped in blend */
 #define SPRING_COG_FADE_RAD 0.35f /* fade cog FF near rest */
 #define SPRING_VEL_LP_HZ 50.f
-// ponytail: CUR_LOOP_EN=1 enables CSA sample+Park telem. CUR_LOOP_CTRL=1 also closes Id/Iq PI.
-// CTRL=0 = sense-only (voltage outer loops; use to inspect Id/Iq without shake).
+// ponytail: CUR_LOOP_EN=1 → async CSA+Park telem (no ISR mid-low wait). CUR_LOOP_CTRL must stay 0
+// until PWM-TRIG/DMA sample exists — ISR busy-wait PI starved USB on SPIN/STRESS (and SPRING before).
 #define CUR_LOOP_EN 1
-#define CUR_LOOP_CTRL 1
-#define CUR_LOOP_DIV 4u /* current PI rate for SPIN/STRESS only */
-// SPIN + CUR_LOOP_CTRL: Iq_ref=0 + spin_uq BEMF FF (soft rest + SPIN_B) + cog FF when LUT≠0.
-// CTRL=0: open-loop spin_uq (KV>ke self-spins — avoid).
+#define CUR_LOOP_CTRL 0
+#define CUR_LOOP_DIV 4u /* sense/PI divider vs PWM */
+// SPIN: voltage spin_uq (KV/B + cog). CTRL=1 path kept in motor.c for future DMA current loop.
 #define SPIN_KV 0.018f /* coast vs creep; with B>0 net FF = KV−B */
 #define SPIN_B 0.008f  /* vel damp on FF — kills touch-shake; keep < KV */
 #define SPIN_W_REST 0.35f /* soft FF ramp starts here; wider → less detent hunting */

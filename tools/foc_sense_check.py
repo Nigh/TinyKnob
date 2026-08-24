@@ -242,10 +242,10 @@ def analyze(rows: list[dict], revs: float) -> int:
 		rc = 0
 	elif (not closed) and same >= 90.0 and ratio < 0.35:
 		if flips_per_rev < POLE_PAIRS * 0.25:
-			print("OK: sense frame looks usable for CUR_LOOP_CTRL=1 trial")
+			print("OK: sense frame looks usable (keep CUR_LOOP_CTRL=0 until DMA sample)")
 			rc = 0
 		else:
-			print("OK-ish: sign/ratio good; flips still noisy (small |Iq|) — try CUR_LOOP_CTRL=1 gently")
+			print("OK-ish: sign/ratio good; flips still noisy (small |Iq|) — stay on voltage outer")
 			rc = 0
 	elif rc == 0:
 		print("MARGINAL: usable but tune TE_OFF/ORD before closing the current loop")
@@ -316,7 +316,7 @@ def main() -> int:
 			usb.util.dispose_resources(dev)
 		except Exception:
 			pass
-		print("device should reappear as RPI-RP2; flash then re-run this script")
+		print("device should reappear as RP2350 (UF2); flash then re-run this script")
 
 	return rc
 

@@ -7,7 +7,7 @@ BUILD_DIR = build
 default: docker_build
 
 build:
-	cmake . -G Ninja -B$(BUILD_DIR) -S.
+	cmake . -G Ninja -B$(BUILD_DIR) -S. -DPICO_BOARD=waveshare_rp2350_zero
 	ninja -C $(BUILD_DIR)
 
 # Host clean; if build/ is root-owned from docker, falls back to docker_clean.
@@ -33,4 +33,4 @@ docker_build:
 	-e HOME=/tmp \
 	-v ${PWD}:/workspace \
 	-w /workspace \
-	xianii/pico-sdk:latest /bin/bash -c "cmake . -G Ninja -Bbuild -S. && ninja -C build"
+	xianii/pico-sdk:latest /bin/bash -c "cmake . -G Ninja -Bbuild -S. -DPICO_BOARD=waveshare_rp2350_zero && ninja -C build"

@@ -32,6 +32,7 @@
 #define DIR_PULSE_COUNTS 80
 #define PWM_MIN_MAG 0.012f
 #define POS_KP 0.6f
+#define POS_D 0.05f
 #define TEST_MOVE_MS 1400u
 #define TEST_HOLD_MS 200u
 #define TEST_UQ_MAX 0.65f
@@ -40,18 +41,27 @@
 // ponytail: K matches POS_KP (known to move). Uq max > DIR_PULSE (cogging), < TEST.
 // 20 kHz raw Δpos is 1ct≈7.7 rad/s — D must see LPF'd vel. Ceiling: lag on fast flicks; upgrade = encoder PLL.
 #define SPRING_K 0.6f
-#define SPRING_D 0.05f
+#define SPRING_D 0.0f
+#define SPRING_D_UQ_MAX 0.12f /* damping may slow return but must not reverse saturated spring effort */
+#define SPRING_SETTLE_MS 2000u /* allow damped rotor to reach its true cog equilibrium */
+#define SPRING_NEUTRAL_RAD 0.00262f /* +/-0.15 deg soft deadband after equilibrium capture */
 #define SPRING_UQ_MAX 0.35f /* soft effort envelope inside blend */
 #define SPRING_WALL_UQ 0.85f /* effort envelope past ±π blend (same sign as K·err) */
 #define SPRING_WALL_BLEND_RAD 0.45f /* soft↔wall envelope over ±π (±~26°) */
 #define SPRING_WALL_D 0.15f /* damping at full wall; lerped in blend */
-#define SPRING_COG_FADE_RAD 0.35f /* fade cog FF near rest */
 #define SPRING_VEL_LP_HZ 50.f
-// ponytail: CUR_LOOP_EN=1 → async CSA+Park telem (no ISR mid-low wait). CUR_LOOP_CTRL must stay 0
-// until PWM-TRIG/DMA sample exists — ISR busy-wait PI starved USB on SPIN/STRESS (and SPRING before).
+// PWM-timed low-side ADC burst + DMA. CTRL stays opt-in until hardware sense is revalidated.
 #define CUR_LOOP_EN 1
-#define CUR_LOOP_CTRL 0
-#define CUR_LOOP_DIV 4u /* sense/PI divider vs PWM */
+#ifndef CUR_LOOP_CTRL
+#define CUR_LOOP_CTRL 1
+#endif
+#ifndef CUR_LOOP_TEST_ONLY
+#define CUR_LOOP_TEST_ONLY 0 /* TEST/POS/SPIN use PI; SPRING/STRESS stay voltage-driven */
+#endif
+#define CUR_LOOP_DIV 2u /* 10 kHz synchronized sample/PI vs 20 kHz PWM */
+#define CUR_SAMPLE_STALE_TICKS 6u /* coast/reset PI after 3 missed current-loop slots */
+#define CS_SAMPLE_BLANK_US 2u /* DRV edge/CSA settling after all three low sides turn on */
+#define CS_SAMPLE_MARGIN_US 2u /* require this much common-low time after the ADC burst */
 // SPIN: voltage spin_uq (KV/B + cog). CTRL=1 path kept in motor.c for future DMA current loop.
 #define SPIN_KV 0.018f /* coast vs creep; with B>0 net FF = KV−B */
 #define SPIN_B 0.008f  /* vel damp on FF — kills touch-shake; keep < KV */
@@ -76,19 +86,22 @@
 #define CS_SIGN (-1.f)
 #define CS_PHASE_ORD 4 /* 0=ABC 1=ACB 2=BAC 3=BCA 4=CAB 5=CBA */
 // Must be 0 while using foc_sense_check sign(Iq)↔Uq; ≠0 parks currents off the voltage axis.
-#define CS_TE_OFF (-0.70f) /* tuned vs foc_sense_check; keep 0 while sweeping ORD */
+#define CS_TE_OFF (-0.70f) /* validated with synchronized foc_sense_check; keep 0 while sweeping ORD */
 #define CS_IQ_LP_HZ 150.f
 // Outer uq_cmd ∈ [-1,1] → Iq_ref (A). Retune with SPRING_K / feel.
-#define IQ_CMD_A 1.0f
+#define IQ_CMD_A 1.0f /* TEST/POS normalized command to amperes */
+#define SPRING_IQ_CMD_A 0.75f
+#define STRESS_IQ_CMD_A 0.20f
 #define I_TRIP_A 4.0f
 // ponytail: PI at CUR_LOOP_DIV rate. Soft on 4015; raise after SOX RC + GAIN match.
 #define CUR_KP 0.25f
 #define CUR_KI 400.f
-#define CUR_U_MAX 0.95f
+#define CUR_KAW 1000.f
+#define CUR_U_MAX 0.60f /* guarantees room for blank + two-channel ADC burst */
 
 // Cogging FF: flash default (cog_lut_default.h) + RAM override after COGCAL / host-learn.
-#define COG_LUT_N 64u
+#define COG_LUT_N 512u /* 0.703 deg/bin; 64-bin table aliased the narrow cog peaks */
 #define COG_CAL_MS 8000u
-#define COG_FF_SCALE 1.0f /* 2.0 felt mushy/heavy; raise only after a clean host-learn */
+#define COG_FF_SCALE 1.0f
 
 #endif

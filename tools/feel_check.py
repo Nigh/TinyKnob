@@ -219,6 +219,10 @@ def main() -> int:
 		if f is None or f["mode"] != MODE_SPRING:
 			raise SystemExit(f"FAIL SET_K {kx10}: left SPRING")
 	print("  SET_K 6→20 ok")
+	# Leave subsequent hand tests at the firmware default, not the validation ceiling.
+	st = send_ack(dev, 0x20, 6)
+	if st == 0:
+		raise SystemExit("FAIL restore SET_K 6 rejected")
 	send(dev, 0x02)
 	wait_mode(dev, MODE_IDLE, timeout=3.0)
 

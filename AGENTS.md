@@ -28,7 +28,7 @@ python3 tools/foc_sense_check.py --no-bootloader   # leave app running for hand 
 
 Flow: STOP → START (align) → GOTO sweep → STOP → print diagnostics → default **UPLOAD** to UF2 (so the next firmware edit can flash immediately).
 
-**Note:** default firmware is `CUR_LOOP_CTRL=0` (voltage outer + async CSA telem). Closed-loop PI needs PWM-TRIG/DMA mid-low sample first — do not re-enable ISR busy-wait PI (starves USB on SPIN/STRESS).
+**Note:** default firmware is `CUR_LOOP_CTRL=1`: TEST/POS/SPIN use the validated current PI; SPRING/STRESS remain voltage-driven for the best hardware feel. Sampling is PWM-timed low-side ADC/DMA; never restore ISR busy-wait sampling (it starves USB on SPIN/STRESS).
 
 ## Feel / SPRING / SPIN / cog (automated)
 
@@ -45,8 +45,8 @@ Exit: `feel_check` `0` ok, `1` fail, `2` warn-only (SPIN rest σ high). Hand: SP
 
 | Define | Role |
 |--------|------|
-| `CUR_LOOP_EN` | Async CSA + Park into telem (no ISR mid-low wait) |
-| `CUR_LOOP_CTRL` | Must be `0` until DMA/compare sample; `1` compiles PI helpers only |
+| `CUR_LOOP_EN` | PWM-timed common-low ADC burst + DMA + Park telemetry |
+| `CUR_LOOP_CTRL` | `1` enables PI for TEST/POS/SPIN; SPRING/STRESS explicitly stay voltage-driven |
 | `CS_SIGN` | ±1 overall current sign |
 | `CS_PHASE_ORD` | 0..5 ABC permutation |
 | `CS_TE_OFF` | Park angle shift vs align `te` (sense only; SVPWM on align `te`) |
@@ -61,18 +61,18 @@ Exit: `feel_check` `0` ok, `1` fail, `2` warn-only (SPIN rest σ high). Hand: SP
 ### Tuning order (do not skip)
 
 1. `CUR_LOOP_CTRL=0`, `CS_TE_OFF=0`, synced CSA offset (firmware recalibrates on START/STOP with mid-low wait, IRQ off).
-2. Sweep `CS_PHASE_ORD` 0..5; pick best `sign(Iq)==sign(Uq)` (or worst≈0% then flip `CS_SIGN`). Async telem is approximate — use for coarse ORD only until DMA sample.
+2. Sweep `CS_PHASE_ORD` 0..5; pick best `sign(Iq)==sign(Uq)` (or worst≈0% then flip `CS_SIGN`) using synchronized telemetry.
 3. Fine `CS_TE_OFF` for high sign match and low `|Id|/|Iq|`.
-4. Keep `CUR_LOOP_CTRL=0` for shipping feel. Re-enable PI only after PWM-TRIG/DMA mid-low sample on RP2350.
+4. Keep `CUR_LOOP_CTRL=1` after sense validation: TEST/POS/SPIN use PI; SPRING/STRESS stay voltage-driven.
 5. `feel_check.py` then hand-test SPRING / SPIN / TEST / STRESS (telem must stay ≥800 Hz under load / freewheel / stress ramps).
-6. **Cogging FF**: bake with `cog_cal.py --host-learn` (fill gates); wrong phase → `--invert`. SPRING/SPIN/STRESS use cog when LUT≠0; TEST/POS skip.
-7. **Voltage outer** for all feel modes (SPRING / SPIN / STRESS / TEST / POS). TinyUSB on core0; `USBCTRL_IRQ` above PWM. Calibrate-only mid-low wait (never in wrap ISR).
+6. **Cogging FF**: bake the 512-point LUT with `cog_cal.py --host-learn` (≥90% fill); wrong phase → `--invert`. SPIN/STRESS use cog; SPRING/TEST/POS skip.
+7. **Per-mode output**: current PI for TEST/POS/SPIN; direct voltage for SPRING/STRESS. TinyUSB on core0; `USBCTRL_IRQ` above PWM. Runtime sampling uses PWM timer + DMA; busy-wait is calibration-only.
 
 ### Pass / fail (script)
 
 - Sense-only: `sign(Iq)==sign(Uq)` ≳90%, `|Id|/|Iq|` ≪1; strong `Iq↔2×fe` ⇒ offset/sample-window or reverse Park.
-- Closed-loop: only after DMA sample + `CUR_LOOP_CTRL=1`; want `sign(Iq)==sign(Iq_ref)` ≳90%.
-- Feel: telem ≥800 Hz in IDLE/TEST/SPRING/SPIN/STRESS; cog learn ≥56/64 bins.
+- Closed-loop: only after synchronized sense validation + `CUR_LOOP_CTRL=1`; want `sign(Iq)==sign(Iq_ref)` ≳90%.
+- Feel: telem ≥800 Hz in IDLE/TEST/SPRING/SPIN/STRESS; cog learn ≥90% of 512 bins.
 - After a failing/passing automated run the device is usually in **UF2** unless `--no-bootloader` / feel_check default leave-app.
 
 ### Agent loop when changing FOC

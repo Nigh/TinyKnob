@@ -7,6 +7,7 @@
 #include "hardware/pwm.h"
 #include "hardware/adc.h"
 #include "hardware/clocks.h"
+#include "hardware/dma.h"
 #include "hardware/gpio.h"
 #include "hardware/irq.h"
 #include <math.h>
@@ -37,6 +38,22 @@ static uint pwm_slice_a;
 static uint pwm_slice_b;
 static uint pwm_slice_c;
 static uint32_t pwm_enable_mask;
+#if CUR_LOOP_EN
+static uint csa_trigger_slice;
+static int csa_dma_chan = -1;
+static uint32_t csa_blank_ticks;
+static uint32_t csa_burst_ticks;
+static uint32_t csa_margin_ticks;
+static volatile uint16_t csa_dma_samples[2];
+static volatile bool csa_dma_busy;
+static volatile bool csa_sample_ready;
+static bool csa_sample_fresh;
+static uint8_t csa_sample_age;
+static float csa_te_active;
+static float csa_te_pending;
+static volatile float csa_te_ready;
+static bool csa_te_valid;
+#endif
 
 static volatile uint8_t mode = MOTOR_IDLE;
 static volatile bool aligned;
@@ -57,6 +74,7 @@ static int32_t move_start;
 static int32_t move_target;
 static int32_t rest_pos;
 static bool rest_hold; // SET_REST: next SPRING keeps this rest (host π sweep)
+static bool spring_capture_neutral;
 static float spring_k = SPRING_K;
 static int32_t pos_last;
 static float vel_filt;
@@ -80,6 +98,7 @@ static bool enc_ok_this;
 
 static float v_off_a, v_off_b, v_off_c;
 static float ia, ib, ic;
+static float id_sample, iq_sample;
 static float id_meas, iq_meas;
 static float iq_ref_cached;
 static float vbus = 12.f;
@@ -189,16 +208,14 @@ static void map_phase_currents(float xa, float xb, float xc) {
 	ic -= cm;
 }
 
-// sync_mid_low: true only with PWM IRQ off (calibrate). false = immediate ADC (telem; wrong window).
-static void sample_phase_currents(bool sync_mid_low) {
-	if(sync_mid_low)
-		wait_lowside_sample_window();
-	float va = adc_volt(0);
-	float vb = adc_volt(1);
-	float vc = adc_volt(2);
+static void sample_phase_currents_raw(uint16_t ra, uint16_t rb) {
+	float va = (float)ra * ADC_TO_V;
+	float vb = (float)rb * ADC_TO_V;
 	float ia_s = (va - v_off_a) * INV_CS_GAIN;
 	float ib_s = (vb - v_off_b) * INV_CS_GAIN;
-	float ic_s = (vc - v_off_c) * INV_CS_GAIN;
+	// Two shunts are sufficient for a three-wire motor; the shorter burst widens
+	// the usable common-low window. Offset/gain calibration keeps reconstruction sane.
+	float ic_s = -(ia_s + ib_s);
 	float xa, xb, xc;
 	csa_correct(ia_s, ib_s, ic_s, &xa, &xb, &xc);
 	map_phase_currents(xa, xb, xc);
@@ -213,6 +230,7 @@ static void sample_vbus_once(void) {
 
 // Must match runtime path: mid-low window at 50% duty. Unsynced avg left αβ DC → ~2×fe in Id/Iq.
 static void calibrate_csa_offset(void) {
+	adc_fifo_setup(false, false, 0u, false, false);
 	motor_set_duty(0.5f, 0.5f, 0.5f);
 	float sa = 0.f, sb = 0.f, sc = 0.f;
 	for(uint32_t i = 0; i < 256u; i++) {
@@ -226,6 +244,8 @@ static void calibrate_csa_offset(void) {
 	v_off_c = sc * (1.f / 256.f);
 	id_meas = 0.f;
 	iq_meas = 0.f;
+	if(csa_dma_chan >= 0)
+		adc_fifo_setup(true, true, 1u, false, false);
 }
 
 // Soft spring with effort envelope: UQ_MAX → WALL across ±π±BLEND (avoids flat→cliff chatter).
@@ -233,6 +253,13 @@ static float spring_uq(int32_t d_counts, float vel, float k) {
 	const float pi = 3.14159265f;
 	float err = (float)d_counts * RAD_PER_COUNT;
 	float ae = fabsf(err);
+	// Suppress encoder-step torque around the captured mechanical equilibrium. Subtracting (rather than clipping at) the deadband keeps torque continuous.
+	float spring_err = 0.f;
+	float neutral_blend = 0.f;
+	if(ae > SPRING_NEUTRAL_RAD) {
+		spring_err = copysignf(ae - SPRING_NEUTRAL_RAD, err);
+		neutral_blend = clampf((ae - SPRING_NEUTRAL_RAD) / SPRING_NEUTRAL_RAD, 0.f, 1.f);
+	}
 	float env = SPRING_UQ_MAX;
 	float d = SPRING_D;
 	float lo = pi - SPRING_WALL_BLEND_RAD;
@@ -245,7 +272,8 @@ static float spring_uq(int32_t d_counts, float vel, float k) {
 		env = SPRING_UQ_MAX + t * (SPRING_WALL_UQ - SPRING_UQ_MAX);
 		d = SPRING_D + t * (SPRING_WALL_D - SPRING_D);
 	}
-	return clampf(k * err - d * vel, -env, env);
+	float damping = clampf(d * neutral_blend * vel, -SPRING_D_UQ_MAX, SPRING_D_UQ_MAX);
+	return clampf(k * spring_err - damping, -env, env);
 }
 
 static bool spring_selfcheck(void) {
@@ -470,6 +498,8 @@ static void sense_park(float te) {
 	float i_beta = (ia + 2.f * ib) * (1.f / 1.73205080757f);
 	float id = i_alpha * c + i_beta * s;
 	float iq = -i_alpha * s + i_beta * c;
+	id_sample = id;
+	iq_sample = iq;
 	float a = CS_IQ_ALPHA;
 	if(a > 1.f)
 		a = 1.f;
@@ -477,54 +507,170 @@ static void sense_park(float te) {
 	iq_meas += a * (iq - iq_meas);
 }
 
-// Park/PI in (te+CS_TE_OFF). SVPWM uses align te except SPIN (same frame for Iq=0 freewheel).
-#if CUR_LOOP_CTRL
-static void apply_current_svpwm(float te, float id_ref, float iq_ref, float uq_ff) {
-	float te_i = te + CS_TE_OFF;
-	float s, c;
-	sincos_lut(te_i, &s, &c);
-	float i_alpha = ia;
-	float i_beta = (ia + 2.f * ib) * (1.f / 1.73205080757f);
-	float id = i_alpha * c + i_beta * s;
-	float iq = -i_alpha * s + i_beta * c;
-	float a = CS_IQ_ALPHA;
-	if(a > 1.f)
-		a = 1.f;
-	id_meas += a * (id - id_meas);
-	iq_meas += a * (iq - iq_meas);
+static void csa_dma_isr(void) {
+	uint32_t mask = 1u << (uint)csa_dma_chan;
+	if(!(dma_hw->ints1 & mask))
+		return;
+	dma_hw->ints1 = mask;
+	adc_run(false);
+	adc_set_round_robin(0);
+	csa_te_ready = csa_te_pending;
+	__dmb();
+	csa_sample_ready = true;
+	csa_dma_busy = false;
+}
 
-	float ed = id_ref - id_meas;
-	float eq = iq_ref - iq_meas;
-	id_i = clampf(id_i + CUR_KI * ed * CUR_DT_S, -CUR_U_MAX, CUR_U_MAX);
-	iq_i = clampf(iq_i + CUR_KI * eq * CUR_DT_S, -CUR_U_MAX, CUR_U_MAX);
-	float ud = clampf(CUR_KP * ed + id_i, -CUR_U_MAX, CUR_U_MAX);
-	// ponytail: BEMF FF on uq so Iq=0 coast isn't PI fighting ke·ω (ceiling: KV≈ke).
-	float uq = clampf(CUR_KP * eq + iq_i + uq_ff, -CUR_U_MAX, CUR_U_MAX);
+static void csa_trigger_isr(void) {
+	uint32_t mask = 1u << csa_trigger_slice;
+	if(!(pwm_get_irq1_status_mask() & mask))
+		return;
+	pwm_clear_irq(csa_trigger_slice);
+	pwm_set_enabled(csa_trigger_slice, false);
+	if(csa_dma_busy || csa_sample_ready)
+		return;
+
+	adc_run(false);
+	adc_fifo_drain();
+	adc_select_input(0);
+	adc_set_round_robin(0x3u);
+	dma_channel_set_write_addr((uint)csa_dma_chan, (void*)csa_dma_samples, false);
+	dma_channel_set_trans_count((uint)csa_dma_chan, 2u, true);
+	csa_dma_busy = true;
+	adc_run(true);
+}
+
+static void csa_sample_cancel(void) {
+	irq_set_enabled(PWM_IRQ_WRAP_1, false);
+	irq_set_enabled(DMA_IRQ_1, false);
+	pwm_set_enabled(csa_trigger_slice, false);
+	pwm_clear_irq(csa_trigger_slice);
+	adc_run(false);
+	adc_set_round_robin(0);
+	if(csa_dma_chan >= 0)
+		dma_channel_abort((uint)csa_dma_chan);
+	dma_hw->ints1 = 1u << (uint)csa_dma_chan;
+	csa_dma_busy = false;
+	csa_sample_ready = false;
+	csa_sample_fresh = false;
+	csa_sample_age = CUR_SAMPLE_STALE_TICKS + 1u;
+	csa_te_valid = false;
+	cur_div = 0;
+	irq_set_enabled(DMA_IRQ_1, true);
+	irq_set_enabled(PWM_IRQ_WRAP_1, true);
+}
+
+// Arm an unused PWM slice as a one-shot timer from this motor PWM wrap. The ADC
+// burst starts after the final high-side pulse and only when it fits completely
+// inside the common-low interval.
+static void csa_sample_arm(void) {
+	if(!csa_te_valid || csa_dma_busy || csa_sample_ready)
+		return;
+	uint32_t hi = duty_to_level(duty_a_cached);
+	uint32_t level = duty_to_level(duty_b_cached);
+	if(level > hi)
+		hi = level;
+	level = duty_to_level(duty_c_cached);
+	if(level > hi)
+		hi = level;
+	uint32_t period = pwm_wrap + 1u;
+	uint32_t need = csa_blank_ticks + csa_burst_ticks + csa_margin_ticks;
+	if(hi >= period || period - hi <= need)
+		return;
+	uint32_t target = hi + csa_blank_ticks;
+	uint32_t now = pwm_get_counter(pwm_slice_a);
+	uint32_t delay = target > now ? target - now : 1u;
+	uint32_t start = now + delay;
+	if(start >= period || period - start <= csa_burst_ticks + csa_margin_ticks)
+		return;
+
+	csa_te_pending = csa_te_active;
+	pwm_set_enabled(csa_trigger_slice, false);
+	pwm_set_counter(csa_trigger_slice, 0u);
+	pwm_set_wrap(csa_trigger_slice, (uint16_t)(delay - 1u));
+	pwm_clear_irq(csa_trigger_slice);
+	pwm_set_enabled(csa_trigger_slice, true);
+}
+
+static bool csa_sample_service(void) {
+	if(csa_sample_ready) {
+		uint16_t ra = csa_dma_samples[0];
+		uint16_t rb = csa_dma_samples[1];
+		float te = csa_te_ready;
+		__dmb();
+		csa_sample_ready = false;
+		sample_phase_currents_raw(ra, rb);
+		sense_park(te);
+		csa_sample_fresh = true;
+		csa_sample_age = 0;
+		if(overcurrent()) {
+			trip_fault();
+			return false;
+		}
+	}
+	if(csa_sample_age < 0xffu)
+		csa_sample_age++;
+	if(++cur_div >= CUR_LOOP_DIV) {
+		cur_div = 0;
+		csa_sample_arm();
+	}
+	return true;
+}
+
+static void csa_sample_init(uint32_t sys_hz) {
+	for(csa_trigger_slice = 0; csa_trigger_slice < NUM_PWM_SLICES; csa_trigger_slice++) {
+		if(!(pwm_enable_mask & (1u << csa_trigger_slice)))
+			break;
+	}
+	hard_assert(csa_trigger_slice < NUM_PWM_SLICES);
+	csa_blank_ticks = (uint32_t)(((uint64_t)sys_hz * CS_SAMPLE_BLANK_US + 999999u) / 1000000u);
+	csa_margin_ticks = (uint32_t)(((uint64_t)sys_hz * CS_SAMPLE_MARGIN_US + 999999u) / 1000000u);
+	uint32_t adc_hz = clock_get_hz(clk_adc);
+	csa_burst_ticks = (uint32_t)(((uint64_t)sys_hz * 2u * 96u + adc_hz - 1u) / adc_hz);
+
+	pwm_config trigger_cfg = pwm_get_default_config();
+	pwm_config_set_clkdiv(&trigger_cfg, 1.f);
+	pwm_config_set_wrap(&trigger_cfg, 1u);
+	pwm_init(csa_trigger_slice, &trigger_cfg, false);
+	pwm_set_irq1_enabled(csa_trigger_slice, true);
+	irq_set_exclusive_handler(PWM_IRQ_WRAP_1, csa_trigger_isr);
+	irq_set_priority(PWM_IRQ_WRAP_1, 0x80);
+	irq_set_enabled(PWM_IRQ_WRAP_1, true);
+
+	csa_dma_chan = dma_claim_unused_channel(true);
+	dma_channel_config cfg = dma_channel_get_default_config((uint)csa_dma_chan);
+	channel_config_set_transfer_data_size(&cfg, DMA_SIZE_16);
+	channel_config_set_read_increment(&cfg, false);
+	channel_config_set_write_increment(&cfg, true);
+	channel_config_set_dreq(&cfg, DREQ_ADC);
+	dma_channel_configure((uint)csa_dma_chan, &cfg, (void*)csa_dma_samples, &adc_hw->fifo, 2u, false);
+	dma_channel_set_irq1_enabled((uint)csa_dma_chan, true);
+	irq_set_exclusive_handler(DMA_IRQ_1, csa_dma_isr);
+	irq_set_priority(DMA_IRQ_1, 0x80);
+	irq_set_enabled(DMA_IRQ_1, true);
+	adc_fifo_setup(true, true, 1u, false, false);
+}
+
+#if CUR_LOOP_CTRL
+static void current_pi_update(float id_ref, float iq_ref, float uq_ff) {
+	float ed = id_ref - id_sample;
+	float eq = iq_ref - iq_sample;
+	id_i += CUR_KI * ed * CUR_DT_S;
+	iq_i += CUR_KI * eq * CUR_DT_S;
+	float ud_raw = CUR_KP * ed + id_i;
+	float uq_raw = CUR_KP * eq + iq_i + uq_ff;
+	float ud = ud_raw;
+	float uq = uq_raw;
+	float mag2 = ud_raw * ud_raw + uq_raw * uq_raw;
+	float max2 = CUR_U_MAX * CUR_U_MAX;
+	if(mag2 > max2) {
+		float scale = CUR_U_MAX / sqrtf(mag2);
+		ud *= scale;
+		uq *= scale;
+	}
+	id_i = clampf(id_i + CUR_KAW * (ud - ud_raw) * CUR_DT_S, -CUR_U_MAX, CUR_U_MAX);
+	iq_i = clampf(iq_i + CUR_KAW * (uq - uq_raw) * CUR_DT_S, -CUR_U_MAX, CUR_U_MAX);
 	ud_hold = ud;
 	uq_hold = uq;
-
-	float te_v = (mode == MOTOR_SPIN) ? te_i : te;
-	sincos_lut(te_v, &s, &c);
-	float mag2 = ud * ud + uq * uq;
-	if(mag2 < PWM_MIN_MAG2) {
-		motor_set_duty(0.5f, 0.5f, 0.5f);
-		return;
-	}
-	if(mag2 > 1.f) {
-		float inv = 1.f / sqrtf(mag2);
-		ud *= inv;
-		uq *= inv;
-	}
-	float ualpha = ud * c - uq * s;
-	float ubeta = ud * s + uq * c;
-	motor_set_duty(0.5f + 0.5f * ualpha,
-			0.5f + 0.5f * (-0.5f * ualpha + SQRT3_2 * ubeta),
-			0.5f + 0.5f * (-0.5f * ualpha - SQRT3_2 * ubeta));
-}
-
-static void apply_hold_svpwm(float te) {
-	float te_v = (mode == MOTOR_SPIN) ? (te + CS_TE_OFF) : te;
-	apply_voltage(ud_hold, uq_hold, te_v);
 }
 #endif
 #endif
@@ -538,40 +684,61 @@ static void apply_cmd(void) {
 #if CUR_LOOP_EN
 	if(te_from_encoder) {
 		float uq_cmd_ff = uq_cmd;
-		// Skip cog on TEST/POS. On SPRING fade near rest (cog buzz at neutral).
-		if(cog_en && mode != MOTOR_COG_CAL && mode != MOTOR_TEST && mode != MOTOR_POS) {
+		// Host LUT is learned in amperes; SPRING outer command is normalized then
+		// scaled by SPRING_IQ_CMD_A. Start at half cancellation to avoid overcompensation.
+		if(cog_en && mode != MOTOR_COG_CAL && mode != MOTOR_TEST &&
+				mode != MOTOR_POS && mode != MOTOR_SPRING) {
 			float c = cog_ff(pos);
-			if(mode == MOTOR_SPRING) {
-				float ae = (float)(rest_pos - pos) * RAD_PER_COUNT;
-				if(ae < 0.f)
-					ae = -ae;
-				c *= clampf(ae / SPRING_COG_FADE_RAD, 0.f, 1.f);
-			}
 			uq_cmd_ff += c;
 		}
 		float uq = (float)dir * uq_cmd_ff;
-		iq_ref_cached = uq * IQ_CMD_A;
-		// All feel modes: voltage SVPWM. Current PI disabled (CUR_LOOP_CTRL=0) — ISR mid-low
-		// busy-wait starved USB on SPIN/STRESS. Re-enable PI only with PWM-TRIG/DMA sample.
+		float iq_scale = IQ_CMD_A;
+		if(mode == MOTOR_SPRING)
+			iq_scale = SPRING_IQ_CMD_A;
+		else if(mode == MOTOR_STRESS)
+			iq_scale = STRESS_IQ_CMD_A;
+		iq_ref_cached = uq * iq_scale;
+		csa_te_active = te;
+		csa_te_valid = true;
+#if CUR_LOOP_CTRL
+#if CUR_LOOP_TEST_ONLY
+		bool use_current = mode == MOTOR_TEST || mode == MOTOR_POS;
+#else
+		bool use_current = mode != MOTOR_COG_CAL && mode != MOTOR_STRESS;
+#endif
+		// ponytail: SPRING stays voltage-driven until a current-domain outer loop is
+		// validated without mode switching, integral bias, or an ampere-domain LUT.
+		if(mode == MOTOR_SPRING)
+			use_current = false;
+		if(use_current) {
+			float uq_ff = (float)dir * uq_ff_cmd;
+			if(csa_sample_age > CUR_SAMPLE_STALE_TICKS) {
+				id_i = 0.f;
+				iq_i = 0.f;
+				ud_hold = 0.f;
+				uq_hold = 0.f;
+			} else if(csa_sample_fresh) {
+				current_pi_update(0.f, iq_ref_cached, uq_ff);
+			}
+			csa_sample_fresh = false;
+			apply_voltage(ud_hold, uq_hold, te);
+			return;
+		}
+#endif
+		// Voltage fallback remains available for untuned modes and stale-loop recovery.
+		id_i = 0.f;
+		iq_i = 0.f;
 		ud_hold = ud_cmd;
 		uq_hold = uq;
 		apply_voltage(ud_cmd, uq, te);
-		if(++cur_div >= CUR_LOOP_DIV) {
-			cur_div = 0;
-			sample_phase_currents(false);
-			if(overcurrent()) {
-				trip_fault();
-				return;
-			}
-			sense_park(te);
-		}
 		return;
 	}
+	csa_te_valid = false;
 	iq_ref_cached = 0.f;
 	apply_voltage(ud_cmd, uq_cmd, te);
 #else
 	float uq_cmd_ff = uq_cmd;
-	if(te_from_encoder && cog_en && mode != MOTOR_COG_CAL)
+	if(te_from_encoder && cog_en && mode != MOTOR_COG_CAL && mode != MOTOR_SPRING)
 		uq_cmd_ff += cog_ff(pos);
 	float uq = te_from_encoder ? (float)dir * uq_cmd_ff : uq_cmd_ff;
 	apply_voltage(ud_cmd, uq, te);
@@ -783,10 +950,22 @@ static void motor_isr(void) {
 	mt6701_start_read();
 
 	if(mode == MOTOR_IDLE || mode == MOTOR_FAULT) {
+#if CUR_LOOP_EN
+		csa_te_valid = false;
+		csa_sample_ready = false;
+#endif
 		return;
 	}
 
+#if CUR_LOOP_EN
+	// Consume the completed burst from the preceding cycle, then arm this cycle's
+	// common-low window before apply_cmd stages the next cycle's PWM compare values.
+	if(!csa_sample_service())
+		return;
+#endif
+
 	mode_tick++;
+	uq_ff_cmd = 0.f;
 	switch(mode) {
 		case MOTOR_ALIGN_RAMP: {
 			uint32_t ramp = ms_to_ticks(ALIGN_RAMP_MS);
@@ -894,11 +1073,25 @@ static void motor_isr(void) {
 			float err = (float)(track_pos - pos) * RAD_PER_COUNT;
 			float vel = vel_update(SPRING_VEL_ALPHA);
 			ud_cmd = 0.f;
-			uq_cmd = clampf(err * POS_KP - SPRING_D * vel, -TEST_UQ_MAX, TEST_UQ_MAX);
+			uq_cmd = clampf(err * POS_KP - POS_D * vel, -TEST_UQ_MAX, TEST_UQ_MAX);
 			te_from_encoder = true;
 			break;
 		}
 		case MOTOR_SPRING: {
+			if(spring_capture_neutral) {
+				// True zero phase voltage: let cog attraction choose the nearest stable
+				// point, then make that point the spring's exact neutral.
+				rest_pos = pos;
+				pos_last = pos;
+				vel_filt = 0.f;
+				ud_cmd = 0.f;
+				uq_cmd = 0.f;
+				te_from_encoder = false;
+				if(mode_tick >= ms_to_ticks(SPRING_SETTLE_MS)) {
+					spring_capture_neutral = false;
+				}
+				break;
+			}
 			float vel = vel_update(SPRING_VEL_ALPHA);
 			ud_cmd = 0.f;
 			uq_cmd = spring_uq(rest_pos - pos, vel, spring_k);
@@ -1036,6 +1229,7 @@ void motor_start(void) {
 #if CUR_LOOP_EN
 	// IRQ off: synced offset at 50% before Ud injects current.
 	irq_set_enabled(PWM_IRQ_WRAP, false);
+	csa_sample_cancel();
 	calibrate_csa_offset();
 	irq_set_enabled(PWM_IRQ_WRAP, true);
 #endif
@@ -1049,6 +1243,7 @@ void motor_cmd_stop(void) {
 	irq_set_enabled(PWM_IRQ_WRAP, false);
 	motor_brake_low();
 #if CUR_LOOP_EN
+	csa_sample_cancel();
 	calibrate_csa_offset();
 #endif
 	enter_mode(MOTOR_IDLE);
@@ -1059,7 +1254,8 @@ bool motor_cmd_spring(void) {
 	if(!aligned || mode == MOTOR_FAULT || is_aligning())
 		return false;
 	irq_set_enabled(PWM_IRQ_WRAP, false);
-	if(!rest_hold)
+	spring_capture_neutral = !rest_hold;
+	if(spring_capture_neutral)
 		rest_pos = pos;
 	rest_hold = false;
 	pos_last = pos;
@@ -1196,7 +1392,7 @@ void motor_setup(void) {
 			(unsigned)CUR_LOOP_DIV, (unsigned)(PWM_HZ / CUR_LOOP_DIV), (double)CS_SIGN,
 			(int)CS_PHASE_ORD, (double)CS_TE_OFF);
 #else
-	LOG_RAW("cur loop SENSE async (no ISR wait) div=%u (~%u Hz) sign=%.0f ord=%d te_off=%.2f\n",
+	LOG_RAW("cur loop SENSE pwm-low DMA div=%u (~%u Hz) sign=%.0f ord=%d te_off=%.2f\n",
 			(unsigned)CUR_LOOP_DIV, (unsigned)(PWM_HZ / CUR_LOOP_DIV), (double)CS_SIGN,
 			(int)CS_PHASE_ORD, (double)CS_TE_OFF);
 #endif
@@ -1244,6 +1440,7 @@ void motor_setup(void) {
 	calibrate_csa_offset();
 	sample_vbus_once();
 	LOG_RAW("csa offset %.3f %.3f %.3f V vbus=%.1f\n", v_off_a, v_off_b, v_off_c, vbus);
+	csa_sample_init(sys);
 #endif
 
 	pwm_clear_irq(pwm_slice_a);

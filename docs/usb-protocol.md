@@ -83,7 +83,7 @@ Total size: **24 bytes**. Bytes 0–13 match the previous 16-byte frame prefix (
 | 4 | `MOTOR_ALIGN_DOWN` | Align ramp down |
 | 5 | `MOTOR_TEST` | ±360° test move |
 | 6 | `MOTOR_SPRING` | Virtual spring inside ±π; hard wall beyond ±π (no wrap-through) |
-| 7 | `MOTOR_SPIN` | Flywheel (`CUR_LOOP_EN`: voltage or Iq≈0) |
+| 7 | `MOTOR_SPIN` | Coast / voltage `spin_uq` (+ cog FF) |
 | 8 | `MOTOR_FAULT` | Fault (CRC etc.); brake |
 | 9 | `MOTOR_POS` | Track absolute angle (streaming setpoint) |
 | 10 | `MOTOR_STRESS` | Burn-in: +full / stop / −full / stop with smooth Uq ramps |

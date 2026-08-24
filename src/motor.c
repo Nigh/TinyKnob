@@ -131,10 +131,10 @@ static void csa_correct(float ia_s, float ib_s, float ic_s, float* ia_o, float* 
 	*ic_o = CSA_C20 * ia_s + CSA_C21 * ib_s + CSA_C22 * ic_s;
 }
 
-// RP2040 edge PWM: OUT high while ctr < level → LS on (INHx low) when ctr >= level.
+// RP2350 edge PWM: OUT high while ctr < level → LS on (INHx low) when ctr >= level.
 // Wait until mid of common low window so all three SOx are valid.
-// ponytail: busy-wait in wrap ISR (~30–40µs @50% duty). Alarm-defer broke SPIN (wrong window →
-// self-oscillation). Upgrade = PWM-compare/DMA sample (or RP2350) — do not re-defer without window check.
+// ponytail: only for calibrate (PWM IRQ off). Never call from wrap ISR — busy-wait starved USB.
+// Upgrade = PWM compare / DMA ADC trigger (RP2350-ready).
 static void wait_lowside_sample_window(void) {
 	uint16_t la = duty_to_level(duty_a_cached);
 	uint16_t lb = duty_to_level(duty_b_cached);
@@ -189,9 +189,10 @@ static void map_phase_currents(float xa, float xb, float xc) {
 	ic -= cm;
 }
 
-// Mid-low CSA sample (sync wait). See wait_lowside_sample_window note.
-static void sample_phase_currents(void) {
-	wait_lowside_sample_window();
+// sync_mid_low: true only with PWM IRQ off (calibrate). false = immediate ADC (telem; wrong window).
+static void sample_phase_currents(bool sync_mid_low) {
+	if(sync_mid_low)
+		wait_lowside_sample_window();
 	float va = adc_volt(0);
 	float vb = adc_volt(1);
 	float vc = adc_volt(2);
@@ -549,44 +550,22 @@ static void apply_cmd(void) {
 			uq_cmd_ff += c;
 		}
 		float uq = (float)dir * uq_cmd_ff;
-		float iq_ref = uq * IQ_CMD_A;
-		iq_ref_cached = iq_ref;
-#if CUR_LOOP_CTRL
-		// Trajectory + SPRING stay voltage (no mid-low busy-wait). Current PI: SPIN/STRESS only.
-		if(mode == MOTOR_SPIN || mode == MOTOR_STRESS) {
-			if(++cur_div >= CUR_LOOP_DIV) {
-				cur_div = 0;
-				sample_phase_currents();
-				if(overcurrent()) {
-					trip_fault();
-					return;
-				}
-				float uq_ff = (mode == MOTOR_SPIN) ? ((float)dir * uq_ff_cmd) : 0.f;
-				apply_current_svpwm(te, 0.f, iq_ref, uq_ff);
-				return;
-			}
-			apply_hold_svpwm(te);
-			return;
-		}
+		iq_ref_cached = uq * IQ_CMD_A;
+		// All feel modes: voltage SVPWM. Current PI disabled (CUR_LOOP_CTRL=0) — ISR mid-low
+		// busy-wait starved USB on SPIN/STRESS. Re-enable PI only with PWM-TRIG/DMA sample.
 		ud_hold = ud_cmd;
 		uq_hold = uq;
 		apply_voltage(ud_cmd, uq, te);
-		return;
-#else
 		if(++cur_div >= CUR_LOOP_DIV) {
 			cur_div = 0;
-			sample_phase_currents();
+			sample_phase_currents(false);
 			if(overcurrent()) {
 				trip_fault();
 				return;
 			}
 			sense_park(te);
 		}
-		ud_hold = ud_cmd;
-		uq_hold = uq;
-		apply_voltage(ud_cmd, uq, te);
 		return;
-#endif
 	}
 	iq_ref_cached = 0.f;
 	apply_voltage(ud_cmd, uq_cmd, te);
@@ -1217,7 +1196,7 @@ void motor_setup(void) {
 			(unsigned)CUR_LOOP_DIV, (unsigned)(PWM_HZ / CUR_LOOP_DIV), (double)CS_SIGN,
 			(int)CS_PHASE_ORD, (double)CS_TE_OFF);
 #else
-	LOG_RAW("cur loop SENSE-ONLY div=%u (~%u Hz) sign=%.0f ord=%d te_off=%.2f\n",
+	LOG_RAW("cur loop SENSE async (no ISR wait) div=%u (~%u Hz) sign=%.0f ord=%d te_off=%.2f\n",
 			(unsigned)CUR_LOOP_DIV, (unsigned)(PWM_HZ / CUR_LOOP_DIV), (double)CS_SIGN,
 			(int)CS_PHASE_ORD, (double)CS_TE_OFF);
 #endif
@@ -1270,7 +1249,7 @@ void motor_setup(void) {
 	pwm_clear_irq(pwm_slice_a);
 	pwm_set_irq_enabled(pwm_slice_a, true);
 	irq_set_exclusive_handler(PWM_IRQ_WRAP, pwm_wrap_isr);
-	// Below USB so mid-low busy-wait can be preempted (else Bulk dies even with core1 tud_task).
+	// Below USB: leftover ISR work must not block Bulk (USBCTRL above PWM).
 	irq_set_priority(PWM_IRQ_WRAP, 0xC0);
 	irq_set_enabled(PWM_IRQ_WRAP, true);
 

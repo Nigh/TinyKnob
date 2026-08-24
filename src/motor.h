@@ -12,7 +12,7 @@ enum {
 	MOTOR_ALIGN_DOWN,
 	MOTOR_TEST,
 	MOTOR_SPRING,
-	MOTOR_SPIN, // Iq=0 + BEMF FF when CUR_LOOP_CTRL; else open-loop spin_uq
+	MOTOR_SPIN, // voltage spin_uq (+ cog); CUR_LOOP_CTRL PI reserved for DMA sample
 	MOTOR_FAULT,
 	MOTOR_POS, // track absolute angle_mrad (streaming setpoint)
 	MOTOR_STRESS, // full-speed fwd/rev burn-in with smooth Uq ramps

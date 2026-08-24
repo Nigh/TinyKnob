@@ -1,6 +1,6 @@
 # TinyKnob
 
-RP2040-Zero + DRV8316 + MT6701 force-feedback knob.
+Waveshare **RP2350-Zero** + DRV8316 + MT6701 force-feedback knob.
 
 `PID=0x4011`
 `VID=0xACDC`
@@ -11,7 +11,7 @@ USB binary protocol (Vendor Bulk telemetry + commands): see [docs/usb-protocol.m
 ## Wiring
 
 ```
-RP2040-Zero          DRV8316
+RP2350-Zero          DRV8316
 GPIO2  ------------- PWM_A / INHA
 GPIO4  ------------- PWM_B / INHB
 GPIO6  ------------- PWM_C / INHC
@@ -22,7 +22,7 @@ GPIO28 <------------ SOC / CSC
 GPIO29 <------------ 0.1×VCC (bus sense; do not wire raw VCC to MCU)
 GND    ------------- GND
 
-RP2040-Zero          MT6701
+RP2350-Zero          MT6701
 GPIO9  ------------- CSN
 GPIO10 ------------- CLK
 GPIO11 <------------ DO
@@ -30,9 +30,9 @@ GPIO11 <------------ DO
 GND    ------------- GND
 ```
 
-Firmware holds GPIO8 high from boot. DRV8316 is 3x PWM. Motor is a 4015 gimbal, 11 pole pairs. GPIO3/5/7 are left free for INLx later.
+Firmware holds GPIO8 high from boot. DRV8316 is 3x PWM. Motor is a 4015 gimbal, 11 pole pairs. GPIO3/5/7 are left free for INLx later. WS2812 on GPIO16 (board default).
 
-Current loop (`pins.h`): `CUR_LOOP_EN=1` samples CSA (mid-low PWM window) and fills telem Id/Iq; `CUR_LOOP_CTRL=1` also closes Id/Iq PI on most modes (`SPIN` stays voltage flywheel). Tune `CS_SIGN` / `CS_PHASE_ORD` / `CS_TE_OFF` if `|Id|≫|Iq|` under pure Uq. Match `CS_GAIN_V_PER_A` to the GAIN pin; SOX needs the datasheet RC LPF. Agent bring-up loop: [AGENTS.md](AGENTS.md).
+Current path (`pins.h`): `CUR_LOOP_EN=1` async CSA telem (no ISR mid-low busy-wait); `CUR_LOOP_CTRL=0` voltage outer on all feel modes so USB telem stays alive under SPIN/STRESS. Closed-loop PI waits on PWM-TRIG/DMA sample. Tune `CS_SIGN` / `CS_PHASE_ORD` / `CS_TE_OFF` for coarse sense. Match `CS_GAIN_V_PER_A` to the GAIN pin. Agent bring-up: [AGENTS.md](AGENTS.md).
 
 ## Prepare
 
@@ -42,10 +42,12 @@ Current loop (`pins.h`): `CUR_LOOP_EN=1` samples CSA (mid-low PWM window) and fi
 docker pull xianii/pico-sdk:latest
 ```
 
+Needs Pico SDK **≥2.0** (RP2350). Image `xianii/pico-sdk:2.3.0` / `latest` is fine.
+
 ### build
 
 ```shell
-# build (docker, files owned by your user)
+# build (docker, files owned by your user) → build/src/RP2350_TinyKnob.uf2
 make
 # remove root-owned build/ from earlier docker runs
 make docker_clean
@@ -53,6 +55,8 @@ make docker_clean
 make format
 make rebuild
 ```
+
+CMake project name: `RP2350_TinyKnob`. Board: `waveshare_rp2350_zero`.
 
 ## Usage
 

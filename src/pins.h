@@ -50,21 +50,18 @@
 #define SPRING_WALL_BLEND_RAD 0.45f /* soft↔wall envelope over ±π (±~26°) */
 #define SPRING_WALL_D 0.15f /* damping at full wall; lerped in blend */
 #define SPRING_VEL_LP_HZ 50.f
-// PWM-timed low-side ADC burst + DMA. CTRL stays opt-in until hardware sense is revalidated.
+// PWM-timed low-side ADC burst + DMA. TEST/POS/SPIN use PI when CTRL=1.
 #define CUR_LOOP_EN 1
 #ifndef CUR_LOOP_CTRL
 #define CUR_LOOP_CTRL 1
-#endif
-#ifndef CUR_LOOP_TEST_ONLY
-#define CUR_LOOP_TEST_ONLY 0 /* TEST/POS/SPIN use PI; SPRING/STRESS stay voltage-driven */
 #endif
 #define CUR_LOOP_DIV 2u /* 10 kHz synchronized sample/PI vs 20 kHz PWM */
 #define CUR_SAMPLE_STALE_TICKS 6u /* coast/reset PI after 3 missed current-loop slots */
 #define CS_SAMPLE_BLANK_US 2u /* DRV edge/CSA settling after all three low sides turn on */
 #define CS_SAMPLE_MARGIN_US 2u /* require this much common-low time after the ADC burst */
-// SPIN: voltage spin_uq (KV/B + cog). CTRL=1 path kept in motor.c for future DMA current loop.
+// SPIN: low-damping voltage FF normally; current-controlled overspeed brake.
 #define SPIN_KV 0.018f /* coast vs creep; with B>0 net FF = KV−B */
-#define SPIN_B 0.008f  /* vel damp on FF — kills touch-shake; keep < KV */
+#define SPIN_B 0.001f  /* slight intentional damping: free-spins, then slowly stops */
 #define SPIN_W_REST 0.35f /* soft FF ramp starts here; wider → less detent hunting */
 #define SPIN_W_MAX 45.f
 #define SPIN_B_CAP 0.30f
@@ -100,8 +97,9 @@
 #define CUR_U_MAX 0.60f /* guarantees room for blank + two-channel ADC burst */
 
 // Cogging FF: flash default (cog_lut_default.h) + RAM override after COGCAL / host-learn.
-#define COG_LUT_N 512u /* 0.703 deg/bin; 64-bin table aliased the narrow cog peaks */
+#define COG_LUT_N 1024u /* 0.352 deg/bin, 16 encoder counts/bin */
 #define COG_CAL_MS 8000u
-#define COG_FF_SCALE 1.0f
+#define SPIN_COG_FF_SCALE 0.770f
+#define SPRING_COG_FF_SCALE 0.100f
 
 #endif

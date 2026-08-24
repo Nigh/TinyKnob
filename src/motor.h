@@ -12,7 +12,7 @@ enum {
 	MOTOR_ALIGN_DOWN,
 	MOTOR_TEST,
 	MOTOR_SPRING,
-	MOTOR_SPIN, // voltage spin_uq (+ cog); CUR_LOOP_CTRL PI stays opt-in
+	MOTOR_SPIN, // low-damping voltage FF + cog; current PI above speed ceiling
 	MOTOR_FAULT,
 	MOTOR_POS, // track absolute angle_mrad (streaming setpoint)
 	MOTOR_STRESS, // full-speed fwd/rev burn-in with smooth Uq ramps
@@ -53,11 +53,14 @@ bool motor_cmd_stress(void);
 bool motor_cmd_cog_cal(void); // slow sweep → RAM LUT override
 void motor_cmd_cog_clear(void); // restore flash LUT (drop RAM override)
 void motor_cog_dump(void); // CDC: print active LUT
-bool motor_cmd_goto(int32_t angle_mrad); // set/track absolute mech angle (telem units)
+bool motor_cmd_goto(int32_t angle_mrad); // legacy position-only GOTO
+bool motor_cmd_goto_vel(int32_t angle_mrad, int32_t velocity_mrad_s);
 void motor_set_duty(float a, float b, float c);
 void motor_get_state(motor_state_t* s);
 void motor_set_spring_k(float k);
 void motor_set_rest_to_current(void);
+bool motor_set_cog_scale(float scale);
+float motor_get_cog_scale(uint8_t mode);
 float motor_get_spring_k(void);
 
 #endif

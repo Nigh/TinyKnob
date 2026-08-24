@@ -130,6 +130,7 @@ enum {
 	TK_CMD_COG_CLEAR = 0x09,
 	TK_CMD_SET_K = 0x20,
 	TK_CMD_SET_REST = 0x21,
+	TK_CMD_SET_COG_SCALE = 0x22,
 	TK_CMD_UPLOAD = 0x7F,
 };
 
@@ -179,6 +180,12 @@ int vendor_cmd(uint8_t const* buffer, uint16_t bufsize) {
 				return 0;
 			int32_t angle_mrad = (int32_t)((uint32_t)buffer[1] | ((uint32_t)buffer[2] << 8) |
 					((uint32_t)buffer[3] << 16) | ((uint32_t)buffer[4] << 24));
+			if(bufsize >= 9) {
+				int32_t velocity_mrad_s = (int32_t)((uint32_t)buffer[5] |
+						((uint32_t)buffer[6] << 8) | ((uint32_t)buffer[7] << 16) |
+						((uint32_t)buffer[8] << 24));
+				return motor_cmd_goto_vel(angle_mrad, velocity_mrad_s) ? 1 : 0;
+			}
 			return motor_cmd_goto(angle_mrad) ? 1 : 0;
 		}
 		case TK_CMD_SET_K:
@@ -188,6 +195,12 @@ int vendor_cmd(uint8_t const* buffer, uint16_t bufsize) {
 		case TK_CMD_SET_REST:
 			motor_set_rest_to_current();
 			return 1;
+		case TK_CMD_SET_COG_SCALE: {
+			if(bufsize < 3)
+				return 0;
+			uint16_t milli = (uint16_t)buffer[1] | ((uint16_t)buffer[2] << 8);
+			return motor_set_cog_scale((float)milli / 1000.f) ? 1 : 0;
+		}
 		case TK_CMD_UPLOAD:
 			enter_uf2_bootloader(); // noreturn
 			return 1;

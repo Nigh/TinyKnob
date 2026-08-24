@@ -28,7 +28,7 @@ python3 tools/foc_sense_check.py --no-bootloader   # leave app running for hand 
 
 Flow: STOP → START (align) → GOTO sweep → STOP → print diagnostics → default **UPLOAD** to UF2 (so the next firmware edit can flash immediately).
 
-**Note:** default firmware is `CUR_LOOP_CTRL=1`: TEST/POS/SPIN use the validated current PI; SPRING/STRESS remain voltage-driven for the best hardware feel. Sampling is PWM-timed low-side ADC/DMA; never restore ISR busy-wait sampling (it starves USB on SPIN/STRESS).
+**Note:** default firmware is `CUR_LOOP_CTRL=1`: TEST/POS use PI; SPIN uses low-damping voltage control with PI overspeed braking; SPRING/STRESS remain voltage-driven for the best hardware feel. Sampling is PWM-timed low-side ADC/DMA; never restore ISR busy-wait sampling (it starves USB on SPIN/STRESS).
 
 ## Feel / SPRING / SPIN / cog (automated)
 
@@ -36,7 +36,7 @@ Flow: STOP → START (align) → GOTO sweep → STOP → print diagnostics → d
 python3 tools/feel_check.py                  # telem≥800Hz; TEST/SPRING/SPIN smoke; SET_K; SPIN jitter warn
 python3 tools/feel_check.py --cog-learn      # also host-learn fill/peak gates (no write)
 python3 tools/cog_cal.py --host-learn --write src/cog_lut_default.h --no-bootloader
-# defaults 20s / 2 rev; exit 1 if bins <56/64 or |peak|≤1e-3 → rebuild+flash
+# defaults 24s / 12 rev each direction; steady samples only, exit 1 if either pass <90% of 1024 bins or |peak|≤1e-3 → rebuild+flash
 ```
 
 Exit: `feel_check` `0` ok, `1` fail, `2` warn-only (SPIN rest σ high). Hand: SPRING voltage soft→wall envelope across ±π; SPIN/STRESS voltage (USB stays up). SPIN detents—if stickier, re-learn `--invert`.
@@ -46,7 +46,7 @@ Exit: `feel_check` `0` ok, `1` fail, `2` warn-only (SPIN rest σ high). Hand: SP
 | Define | Role |
 |--------|------|
 | `CUR_LOOP_EN` | PWM-timed common-low ADC burst + DMA + Park telemetry |
-| `CUR_LOOP_CTRL` | `1` enables PI for TEST/POS/SPIN; SPRING/STRESS explicitly stay voltage-driven |
+| `CUR_LOOP_CTRL` | `1` enables PI for TEST/POS and SPIN overspeed braking; normal SPIN/SPRING/STRESS stay voltage-driven |
 | `CS_SIGN` | ±1 overall current sign |
 | `CS_PHASE_ORD` | 0..5 ABC permutation |
 | `CS_TE_OFF` | Park angle shift vs align `te` (sense only; SVPWM on align `te`) |
@@ -63,16 +63,16 @@ Exit: `feel_check` `0` ok, `1` fail, `2` warn-only (SPIN rest σ high). Hand: SP
 1. `CUR_LOOP_CTRL=0`, `CS_TE_OFF=0`, synced CSA offset (firmware recalibrates on START/STOP with mid-low wait, IRQ off).
 2. Sweep `CS_PHASE_ORD` 0..5; pick best `sign(Iq)==sign(Uq)` (or worst≈0% then flip `CS_SIGN`) using synchronized telemetry.
 3. Fine `CS_TE_OFF` for high sign match and low `|Id|/|Iq|`.
-4. Keep `CUR_LOOP_CTRL=1` after sense validation: TEST/POS/SPIN use PI; SPRING/STRESS stay voltage-driven.
+4. Keep `CUR_LOOP_CTRL=1` after sense validation: TEST/POS and SPIN overspeed braking use PI; normal SPIN/SPRING/STRESS stay voltage-driven.
 5. `feel_check.py` then hand-test SPRING / SPIN / TEST / STRESS (telem must stay ≥800 Hz under load / freewheel / stress ramps).
-6. **Cogging FF**: bake the 512-point LUT with `cog_cal.py --host-learn` (≥90% fill); wrong phase → `--invert`. SPIN/STRESS use cog; SPRING/TEST/POS skip.
-7. **Per-mode output**: current PI for TEST/POS/SPIN; direct voltage for SPRING/STRESS. TinyUSB on core0; `USBCTRL_IRQ` above PWM. Runtime sampling uses PWM timer + DMA; busy-wait is calibration-only.
+6. **Cogging FF**: bake the 1024-point LUT with continuous bidirectional `cog_cal.py --host-learn` (≥90% steady-sample fill per pass); wrong phase → `--invert`. SPIN/STRESS use cog; SPRING/TEST/POS skip.
+7. **Per-mode output**: current PI for TEST/POS and SPIN overspeed braking; direct voltage for normal SPIN/SPRING/STRESS. TinyUSB on core0; `USBCTRL_IRQ` above PWM. Runtime sampling uses PWM timer + DMA; busy-wait is calibration-only.
 
 ### Pass / fail (script)
 
 - Sense-only: `sign(Iq)==sign(Uq)` ≳90%, `|Id|/|Iq|` ≪1; strong `Iq↔2×fe` ⇒ offset/sample-window or reverse Park.
 - Closed-loop: only after synchronized sense validation + `CUR_LOOP_CTRL=1`; want `sign(Iq)==sign(Iq_ref)` ≳90%.
-- Feel: telem ≥800 Hz in IDLE/TEST/SPRING/SPIN/STRESS; cog learn ≥90% of 512 bins.
+- Feel: telem ≥800 Hz in IDLE/TEST/SPRING/SPIN/STRESS; cog learn ≥90% of 1024 bins per direction with speed CV ≤0.35.
 - After a failing/passing automated run the device is usually in **UF2** unless `--no-bootloader` / feel_check default leave-app.
 
 ### Agent loop when changing FOC

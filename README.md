@@ -56,6 +56,18 @@ make format
 make rebuild
 ```
 
+For rapid cogging-compensation feel tuning (requires `pyusb` and an auto-mounted
+RP2350 UF2 volume), one command edits the SPIN default scale, builds, flashes, aligns, and
+leaves the device in SPIN:
+
+```shell
+source ~/venv/bin/activate
+python3 tools/set_cog_scale.py 0.60
+```
+
+The script also accepts a device already in UF2 mode. Set `RP2350_MOUNT` for a
+nonstandard mount path. If the volume denies writes, only the `cp` step asks for sudo.
+
 CMake project name: `RP2350_TinyKnob`. Board: `waveshare_rp2350_zero`.
 
 ## Usage
@@ -89,6 +101,7 @@ Vendor Bulk OUT opcodes:
 - `0x09` COG_CLEAR
 - `0x20` SET_K, byte 1 = K * 10
 - `0x21` SET_REST to current angle
+- `0x22` SET_COG_SCALE, bytes 1–2 = little-endian `u16(scale * 1000)`; updates current SPRING/SPIN scale immediately. Entering either mode emits `5B 01 mode scale_lo scale_hi`
 - `0x7F` UPLOAD reboot to UF2 bootloader (no ACK; device disconnects)
 
 Bulk IN pushes 24-byte frames (~1 kHz): magic `0xA5`, mode, angle, duties, seq, Id/Iq/Iq_ref (mA), Vbus (mV), Uq Q15.

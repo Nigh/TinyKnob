@@ -32,7 +32,7 @@ GND    ------------- GND
 
 Firmware holds GPIO8 high from boot. DRV8316 is 3x PWM. Motor is a 4015 gimbal, 11 pole pairs. GPIO3/5/7 are left free for INLx later. WS2812 on GPIO16 (board default).
 
-Current path (`pins.h`): `CUR_LOOP_EN=1` async CSA telem (no ISR mid-low busy-wait); `CUR_LOOP_CTRL=0` voltage outer on all feel modes so USB telem stays alive under SPIN/STRESS. Closed-loop PI waits on PWM-TRIG/DMA sample. Tune `CS_SIGN` / `CS_PHASE_ORD` / `CS_TE_OFF` for coarse sense. Match `CS_GAIN_V_PER_A` to the GAIN pin. Agent bring-up: [AGENTS.md](AGENTS.md).
+Current path (`pins.h`): `CUR_LOOP_EN=1` uses PWM-timed low-side ADC/DMA telemetry; `CUR_LOOP_CTRL=1` enables the validated current PI for TEST/POS/SPIN, while SPRING/STRESS stay voltage-driven for stable feel. Tune `CS_SIGN` / `CS_PHASE_ORD` / `CS_TE_OFF`, and match `CS_GAIN_V_PER_A` to the GAIN pin. Agent bring-up: [AGENTS.md](AGENTS.md).
 
 ## Prepare
 

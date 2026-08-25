@@ -69,6 +69,21 @@
 #define SPIN_IQ_CAP 0.20f /* opposing Iq (A) when |ω|>SPIN_W_MAX under current loop */
 #define SPIN_UQ_MAX 0.50f
 #define SPIN_VEL_LP_HZ 120.f
+// GEAR: match the dominant 24th mechanical cog harmonic so every virtual
+// valley sees the same physical cog phase instead of alternating at 48 teeth.
+#define GEAR_TEETH 24u
+#define GEAR_UQ 0.30f
+#define GEAR_PEAK_FRAC 0.86f
+#define GEAR_CLICK_UQ 0.08f
+#define GEAR_CLICK_US 50u
+#define GEAR_CAPTURE_MIN_MS 250u
+#define GEAR_CAPTURE_STABLE_MS 120u
+#define GEAR_CAPTURE_TIMEOUT_MS 1200u
+#define GEAR_CAPTURE_W_MAX 0.10f
+#define GEAR_D 0.0008f
+#define GEAR_D_UQ_MAX 0.03f
+#define GEAR_VEL_LP_HZ 80.f
+#define GEAR_COG_FF_SCALE 1.00f
 // Stress: +full 3s / coast 1s / -full 3s / coast 1s; Uq smoothstep on start & stop.
 #define STRESS_UQ_MAX 0.65f
 #define STRESS_RUN_MS 3000u

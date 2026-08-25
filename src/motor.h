@@ -17,6 +17,7 @@ enum {
 	MOTOR_POS, // track absolute angle_mrad (streaming setpoint)
 	MOTOR_STRESS, // full-speed fwd/rev burn-in with smooth Uq ramps
 	MOTOR_COG_CAL, // slow +1 rev; fill cogging LUT then IDLE
+	MOTOR_GEAR, // fine periodic detents for a mechanical gear feel
 };
 
 typedef struct {
@@ -51,6 +52,7 @@ bool motor_cmd_spin(void);
 bool motor_cmd_test(void);
 bool motor_cmd_stress(void);
 bool motor_cmd_cog_cal(void); // slow sweep → RAM LUT override
+bool motor_cmd_gear(void);
 void motor_cmd_cog_clear(void); // restore flash LUT (drop RAM override)
 void motor_cog_dump(void); // CDC: print active LUT
 bool motor_cmd_goto(int32_t angle_mrad); // legacy position-only GOTO

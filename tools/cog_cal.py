@@ -258,15 +258,33 @@ def collect_pass(dev, span: int, seconds: float, label: str) -> np.ndarray:
 	return means
 
 
-def host_learn(dev, seconds: float, revs: float, invert: bool = False) -> np.ndarray:
+def host_learn(
+	dev, seconds: float, revs: float, passes: int = 3, invert: bool = False
+) -> np.ndarray:
 	"""Average steady forward/reverse effort by angle to reject friction and lag."""
 	send(dev, 0x09)  # POS deliberately skips cog FF
 	time.sleep(0.05)
 	wait_mode(dev, 0, timeout=3.0)
 	span = int(revs * MRAD_2PI)
-	print("host-learn continuous bidirectional (hands off)...")
-	forward = collect_pass(dev, span, seconds, "forward")
-	reverse = collect_pass(dev, -span, seconds, "reverse")
+	print(f"host-learn {passes}x continuous bidirectional (hands off)...")
+	forwards = []
+	reverses = []
+	for run in range(passes):
+		print(f"pair {run + 1}/{passes}")
+		forwards.append(collect_pass(dev, span, seconds, "forward"))
+		reverses.append(collect_pass(dev, -span, seconds, "reverse"))
+	forward = np.median(np.stack(forwards), axis=0)
+	reverse = np.median(np.stack(reverses), axis=0)
+	if passes > 1:
+		pairs = np.stack([
+			0.5 * (f - np.mean(f) + r - np.mean(r))
+			for f, r in zip(forwards, reverses)
+		])
+		spread = np.std(pairs, axis=0)
+		print(
+			f"repeatability rms={float(np.sqrt(np.mean(spread**2))):.5f} "
+			f"peak={float(np.max(spread)):.5f}"
+		)
 	fc = forward - np.mean(forward)
 	rc = reverse - np.mean(reverse)
 	corr = float(np.corrcoef(fc, rc)[0, 1])
@@ -315,9 +333,12 @@ def main() -> int:
 	ap.add_argument("--invert", action="store_true", help="negate LUT (try if FF feels sticky)")
 	ap.add_argument("--seconds", type=float, default=24.0)
 	ap.add_argument("--revs", type=float, default=12.0, help="revolutions per direction")
+	ap.add_argument("--passes", type=int, default=3, help="bidirectional pairs to median")
 	ap.add_argument("--no-bootloader", action="store_true")
 	ap.add_argument("--skip-start", action="store_true")
 	args = ap.parse_args()
+	if args.passes < 1:
+		ap.error("--passes must be >=1")
 	if not args.host_learn and not args.device_cal:
 		args.host_learn = True  # default: bake path
 
@@ -329,7 +350,9 @@ def main() -> int:
 
 	lut = None
 	if args.host_learn:
-		lut = host_learn(dev, args.seconds, args.revs, invert=args.invert)
+		lut = host_learn(
+			dev, args.seconds, args.revs, passes=args.passes, invert=args.invert
+		)
 		# Gates already enforced inside host_learn before return.
 		if args.write:
 			write_header(args.write, lut)

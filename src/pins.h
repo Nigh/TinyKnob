@@ -61,9 +61,10 @@
 #define CS_SAMPLE_MARGIN_US 2u /* require this much common-low time after the ADC burst */
 // SPIN: low-damping voltage FF normally; current-controlled overspeed brake.
 #define SPIN_KV 0.018f /* coast vs creep; with B>0 net FF = KV−B */
-#define SPIN_B 0.001f  /* slight intentional damping: free-spins, then slowly stops */
+#define SPIN_B 0.000075f /* low-speed damping: light enough to preserve flick inertia */
+#define SPIN_B_HIGH 0.0015f /* smoothly reached at W_MAX so faster spins settle */
 #define SPIN_W_REST 0.35f /* soft FF ramp starts here; wider → less detent hunting */
-#define SPIN_W_MAX 45.f
+#define SPIN_W_MAX 22.f
 #define SPIN_B_CAP 0.30f
 #define SPIN_IQ_CAP 0.20f /* opposing Iq (A) when |ω|>SPIN_W_MAX under current loop */
 #define SPIN_UQ_MAX 0.50f
@@ -99,7 +100,7 @@
 // Cogging FF: flash default (cog_lut_default.h) + RAM override after COGCAL / host-learn.
 #define COG_LUT_N 1024u /* 0.352 deg/bin, 16 encoder counts/bin */
 #define COG_CAL_MS 8000u
-#define SPIN_COG_FF_SCALE 0.770f
+#define SPIN_COG_FF_SCALE 0.650f
 #define SPRING_COG_FF_SCALE 0.100f
 
 #endif

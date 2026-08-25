@@ -329,7 +329,9 @@ static float spin_voltage_ff(float vel) {
 	float over = absv - SPIN_W_MAX;
 	// Soft ramp just above rest so FF doesn't cliff-edge into detent hunting.
 	float ramp = clampf((absv - SPIN_W_REST) / SPIN_W_REST, 0.f, 1.f);
-	float u = (SPIN_KV - SPIN_B) * vel * ramp;
+	float speed_frac = clampf(absv / SPIN_W_MAX, 0.f, 1.f);
+	float damping = SPIN_B + (SPIN_B_HIGH - SPIN_B) * speed_frac * speed_frac;
+	float u = (SPIN_KV - damping) * vel * ramp;
 	if(over > 0.f)
 		u -= signv * clampf(over / SPIN_W_MAX, 0.f, 1.f) * SPIN_B_CAP;
 	return clampf(u, -SPIN_UQ_MAX, SPIN_UQ_MAX);
@@ -353,10 +355,12 @@ static bool spin_selfcheck(void) {
 		return false;
 	if(SPIN_B < 0.f || SPIN_B >= SPIN_KV)
 		return false;
+	if(SPIN_B_HIGH < SPIN_B || SPIN_B_HIGH >= SPIN_KV)
+		return false;
 	if(spin_voltage_ff(2.f) <= 0.f || spin_voltage_ff(-2.f) >= 0.f)
 		return false;
-	if(spin_voltage_ff(SPIN_W_MAX + 20.f) >= spin_voltage_ff(SPIN_W_MAX * 0.5f))
-		return false; // soft cap must reduce drive vs mid-band
+	if(spin_voltage_ff(SPIN_W_MAX + 20.f) >= spin_voltage_ff(SPIN_W_MAX))
+		return false; // soft cap must reduce drive above the speed ceiling
 	if(spin_iq_ref(SPIN_W_MAX) != 0.f || spin_iq_ref(SPIN_W_MAX * 2.f) >= 0.f ||
 			spin_iq_ref(-SPIN_W_MAX * 2.f) <= 0.f)
 		return false;

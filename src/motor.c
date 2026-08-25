@@ -21,6 +21,7 @@
 #define PWM_MIN_MAG2 (PWM_MIN_MAG * PWM_MIN_MAG)
 #define SPRING_VEL_ALPHA (TWO_PI * SPRING_VEL_LP_HZ / (float)PWM_HZ)
 #define SPIN_VEL_ALPHA (TWO_PI * SPIN_VEL_LP_HZ / (float)PWM_HZ)
+#define GEAR_VEL_ALPHA (TWO_PI * GEAR_VEL_LP_HZ / (float)PWM_HZ)
 #define ADC_TO_V (CS_VREF / 4095.f)
 #define INV_CS_GAIN (1.f / CS_GAIN_V_PER_A)
 #define CUR_DT_S ((float)CUR_LOOP_DIV / (float)PWM_HZ)
@@ -78,6 +79,12 @@ static bool spring_capture_neutral;
 static float spring_k = SPRING_K;
 static int32_t pos_last;
 static float vel_filt;
+static float gear_center_pos;
+static float gear_prev_progress;
+static uint32_t gear_click_ticks;
+static bool gear_capture;
+static uint32_t gear_capture_stable_ticks;
+static float gear_cog_center;
 
 static bool have_enc;
 static uint16_t prev_raw;
@@ -369,6 +376,65 @@ static bool spin_selfcheck(void) {
 	if(SPIN_W_MAX <= SPIN_W_REST)
 		return false;
 	return true;
+}
+
+static float gear_uq(int32_t p, float vel) {
+	float tooth_counts = (float)COUNTS_PER_REV / (float)GEAR_TEETH;
+	float x = ((float)p - gear_center_pos) / tooth_counts;
+	// At an integer valley the old and new symmetric curves are both zero, so
+	// advance immediately. Waiting for a narrow low-speed window can miss a
+	// valley and accidentally turn the original center into a global spring.
+	int32_t crossed = (int32_t)x;
+	if(crossed != 0) {
+		gear_center_pos += (float)crossed * tooth_counts;
+		gear_cog_center = cog_ff((int32_t)gear_center_pos);
+		x = ((float)p - gear_center_pos) / tooth_counts;
+		gear_prev_progress = 0.f;
+	}
+
+	float ax = fabsf(x);
+	float progress = ax - floorf(ax);
+	if(progress >= GEAR_PEAK_FRAC && gear_prev_progress < GEAR_PEAK_FRAC)
+		gear_click_ticks = (PWM_HZ * GEAR_CLICK_US) / 1000000u;
+	gear_prev_progress = progress;
+
+	// Resistance rises near the next valley, then drops immediately to zero
+	// after the peak. There is no forward attraction to add skip energy.
+	float mag = 0.f;
+	if(progress < GEAR_PEAK_FRAC) {
+		float rise = progress / GEAR_PEAK_FRAC;
+		mag = GEAR_UQ * rise * rise * rise;
+	}
+	float damping = clampf(GEAR_D * vel, -GEAR_D_UQ_MAX, GEAR_D_UQ_MAX);
+	float sign = x < 0.f ? -1.f : 1.f;
+	float click = 0.f;
+	if(gear_click_ticks > 0) {
+		// Past the peak, kick with the motion to mimic the tooth snapping free.
+		click = sign * GEAR_CLICK_UQ;
+		gear_click_ticks--;
+	}
+	return clampf(-sign * mag + click - damping,
+			-GEAR_UQ - GEAR_CLICK_UQ - GEAR_D_UQ_MAX,
+			GEAR_UQ + GEAR_CLICK_UQ + GEAR_D_UQ_MAX);
+}
+
+static bool gear_selfcheck(void) {
+	if(GEAR_TEETH < 12u || GEAR_TEETH > 128u || GEAR_UQ <= PWM_MIN_MAG ||
+			GEAR_UQ > 1.f || GEAR_PEAK_FRAC <= 0.5f || GEAR_PEAK_FRAC >= 1.f)
+		return false;
+	if(GEAR_CLICK_UQ < 0.f || GEAR_CLICK_US == 0u ||
+			(PWM_HZ * GEAR_CLICK_US) / 1000000u == 0u)
+		return false;
+	int32_t quarter_tooth = (int32_t)(COUNTS_PER_REV / (4u * GEAR_TEETH));
+	gear_center_pos = 0.f;
+	gear_prev_progress = 0.f;
+	gear_click_ticks = 0;
+	bool forward = gear_uq(quarter_tooth, 1.f) < 0.f;
+	gear_center_pos = 0.f;
+	gear_prev_progress = 0.f;
+	gear_click_ticks = 0;
+	bool reverse = gear_uq(-quarter_tooth, -1.f) > 0.f;
+	return forward && reverse && GEAR_D >= 0.f;
 }
 
 static bool csa_selfcheck(void) {
@@ -711,6 +777,8 @@ static void apply_cmd(void) {
 		if(cog_en && mode != MOTOR_COG_CAL && mode != MOTOR_TEST &&
 				mode != MOTOR_POS) {
 			float c = cog_ff(pos);
+			if(mode == MOTOR_GEAR)
+				c -= gear_cog_center;
 			uq_cmd_ff += c;
 		}
 		float uq = (float)dir * uq_cmd_ff;
@@ -805,7 +873,8 @@ static float cog_ff(int32_t p) {
 		r += (int32_t)COUNTS_PER_REV;
 	uint32_t span = COUNTS_PER_REV / COG_LUT_N;
 	float frac = span ? (float)(r % (int32_t)span) / (float)span : 0.f;
-	float scale = mode == MOTOR_SPRING ? spring_cog_scale : spin_cog_scale;
+	float scale = mode == MOTOR_SPRING ? spring_cog_scale :
+			(mode == MOTOR_GEAR ? GEAR_COG_FF_SCALE : spin_cog_scale);
 	return scale * (cog_lut[i0] + (cog_lut[i1] - cog_lut[i0]) * frac);
 }
 
@@ -1143,6 +1212,36 @@ static void motor_isr(void) {
 			te_from_encoder = true;
 			break;
 		}
+		case MOTOR_GEAR: {
+			float vel = vel_update(GEAR_VEL_ALPHA);
+			ud_cmd = 0.f;
+			if(gear_capture) {
+				// With zero phase voltage, let the rotor fall into the nearest
+				// physical slot valley before anchoring the symmetric virtual tooth.
+				uq_cmd = 0.f;
+				te_from_encoder = false;
+				gear_center_pos = (float)pos;
+				if(mode_tick >= ms_to_ticks(GEAR_CAPTURE_MIN_MS) &&
+						fabsf(vel) <= GEAR_CAPTURE_W_MAX)
+					gear_capture_stable_ticks++;
+				else
+					gear_capture_stable_ticks = 0;
+				if(gear_capture_stable_ticks >= ms_to_ticks(GEAR_CAPTURE_STABLE_MS) ||
+						mode_tick >= ms_to_ticks(GEAR_CAPTURE_TIMEOUT_MS)) {
+					gear_capture = false;
+					gear_center_pos = (float)pos;
+					gear_cog_center = cog_ff(pos);
+					gear_prev_progress = 0.f;
+					gear_click_ticks = 0;
+					pos_last = pos;
+					vel_filt = 0.f;
+				}
+				break;
+			}
+			uq_cmd = gear_uq(pos, vel);
+			te_from_encoder = true;
+			break;
+		}
 		case MOTOR_STRESS: {
 			ud_cmd = 0.f;
 			te_from_encoder = true;
@@ -1300,6 +1399,24 @@ bool motor_cmd_spin(void) {
 	return true;
 }
 
+bool motor_cmd_gear(void) {
+	if(!aligned || mode == MOTOR_FAULT || is_aligning())
+		return false;
+	irq_set_enabled(PWM_IRQ_WRAP, false);
+	pos_last = pos;
+	vel_filt = 0.f;
+	gear_center_pos = (float)pos;
+	gear_prev_progress = 0.f;
+	gear_click_ticks = 0;
+	gear_capture = true;
+	gear_capture_stable_ticks = 0;
+	gear_cog_center = 0.f;
+	cur_pi_reset();
+	enter_mode(MOTOR_GEAR);
+	irq_set_enabled(PWM_IRQ_WRAP, true);
+	return true;
+}
+
 bool motor_cmd_test(void) {
 	if(!aligned || mode == MOTOR_FAULT || is_aligning())
 		return false;
@@ -1422,6 +1539,8 @@ void motor_setup(void) {
 		LOG_RAW("spring selfcheck FAIL\n");
 	if(!spin_selfcheck())
 		LOG_RAW("spin selfcheck FAIL\n");
+	if(!gear_selfcheck())
+		LOG_RAW("gear selfcheck FAIL\n");
 	if(!cog_selfcheck())
 		LOG_RAW("cog selfcheck FAIL\n");
 	cog_load_flash();

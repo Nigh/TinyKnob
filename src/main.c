@@ -40,7 +40,7 @@ bool timer_4hz_callback(struct repeating_timer* t) {
 #define U32RGB(r, g, b) (((uint32_t)(r) << 8) | ((uint32_t)(g) << 16) | (uint32_t)(b))
 
 // LED: align=orange blink, idle unaligned=green blink, idle armed=green, spring=blue,
-	// spin=cyan, test=white blink, pos=yellow, stress=magenta blink, fault=red.
+	// spin=cyan, gear=violet, test=white blink, pos=yellow, stress=magenta blink, fault=red.
 	// UPLOAD purple is set in enter_uf2_bootloader before bootrom.
 static void led_status(void) {
 	static uint8_t tick;
@@ -79,6 +79,10 @@ static void led_status(void) {
 	}
 	if(st.mode == MOTOR_COG_CAL) {
 		ws2812_setpixel(on ? U32RGB(32, 16, 0) : U32RGB(8, 4, 0));
+		return;
+	}
+	if(st.mode == MOTOR_GEAR) {
+		ws2812_setpixel(U32RGB(18, 0, 30));
 		return;
 	}
 	// IDLE: blink green until START align; solid green when armed
@@ -128,6 +132,7 @@ enum {
 	TK_CMD_STRESS = 0x07,
 	TK_CMD_COG_CAL = 0x08,
 	TK_CMD_COG_CLEAR = 0x09,
+	TK_CMD_GEAR = 0x0A,
 	TK_CMD_SET_K = 0x20,
 	TK_CMD_SET_REST = 0x21,
 	TK_CMD_SET_COG_SCALE = 0x22,
@@ -175,6 +180,8 @@ int vendor_cmd(uint8_t const* buffer, uint16_t bufsize) {
 		case TK_CMD_COG_CLEAR:
 			motor_cmd_cog_clear();
 			return 1;
+		case TK_CMD_GEAR:
+			return motor_cmd_gear() ? 1 : 0;
 		case TK_CMD_GOTO: {
 			if(bufsize < 5)
 				return 0;
@@ -233,6 +240,14 @@ static void serial_handle_line(const char* line) {
 	if(strcmp(line, "SPIN") == 0) {
 		if(motor_cmd_spin()) {
 			LOG_RAW("SPIN\n");
+		} else {
+			LOG_RAW("need START\n");
+		}
+		return;
+	}
+	if(strcmp(line, "GEAR") == 0) {
+		if(motor_cmd_gear()) {
+			LOG_RAW("GEAR\n");
 		} else {
 			LOG_RAW("need START\n");
 		}
@@ -335,7 +350,7 @@ int main() {
 	// Above PWM wrap so any residual ISR wait can be preempted.
 	irq_set_priority(USBCTRL_IRQ, 0x40);
 	cdc_log_init();
-	LOG_RAW("boot: IDLE; send START then SPRING SPIN TEST STRESS COGCAL COGCLEAR GOTO STOP DUMP UPLOAD\n");
+	LOG_RAW("boot: IDLE; send START then SPRING SPIN GEAR TEST STRESS COGCAL COGCLEAR GOTO STOP DUMP UPLOAD\n");
 	while(true) {
 		app_sched_execute();
 		tud_task();

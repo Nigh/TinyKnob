@@ -6,6 +6,10 @@ Follow the global ponytail rules (`~/AGENTS.md` / Cursor ponytail): YAGNI, stdli
 
 Target: **Waveshare RP2350-Zero** (`PICO_BOARD=waveshare_rp2350_zero`), CMake project `RP2350_TinyKnob`.
 
+Motor: 24-slot / 22-pole (11 pole pairs), delta winding. Rated 12–36 V.
+At 12 V: 4 A maximum, 0.65 A rated, 610 RPM rated. At 24 V: 4 A
+maximum, 1.4 A rated, 1100 RPM rated.
+
 ```shell
 make docker_clean          # wipe build/
 make docker_build          # → build/src/RP2350_TinyKnob.uf2

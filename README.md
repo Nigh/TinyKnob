@@ -1,6 +1,8 @@
 # TinyKnob
 
-Waveshare **RP2350-Zero** + DRV8316 + MT6701 force-feedback knob.
+DRV8316 + MT6701 force-feedback knob firmware. The complete implementation targets
+Waveshare **RP2350-Zero**. An STM32G431CBU6 LL build/DFU skeleton is also available;
+it deliberately has no board I/O or motor support until its pin map is supplied.
 
 `PID=0x4011`
 `VID=0xACDC`
@@ -34,11 +36,46 @@ Firmware holds GPIO8 high from boot. DRV8316 is 3x PWM. Motor is a 4015 gimbal, 
 
 Current path (`pins.h`): `CUR_LOOP_EN=1` uses PWM-timed low-side ADC/DMA telemetry; `CUR_LOOP_CTRL=1` enables the validated current PI for TEST/POS/SPIN, while SPRING/STRESS stay voltage-driven for stable feel. Tune `CS_SIGN` / `CS_PHASE_ORD` / `CS_TE_OFF`, and match `CS_GAIN_V_PER_A` to the GAIN pin. Agent bring-up: [AGENTS.md](AGENTS.md).
 
+### WeAct STM32G431CBU6 mapping
+
+The STM32 target uses the WeAct STM32G431 Core Board QFN48 V1.0 pinout. This is
+the assigned TinyKnob wiring; peripheral drivers are not implemented yet.
+
+| TinyKnob function | WeAct pin | STM32 peripheral |
+|---|---|---|
+| PWM_A / INHA | PA8 | TIM1_CH1 |
+| PWM_B / INHB | PA9 | TIM1_CH2 |
+| PWM_C / INHC | PA10 | TIM1_CH3 |
+| DRV_EN / nSLEEP | PC4 | GPIO output |
+| MT6701 CSN | PA4 | GPIO output |
+| MT6701 CLK | PA5 | SPI1_SCK |
+| MT6701 DO | PA6 | SPI1_MISO |
+| DRV8316 SOA / CSA | PA0 | ADC input |
+| DRV8316 SOB / CSB | PA1 | ADC input |
+| DRV8316 SOC / CSC | PA2 | ADC input |
+| 0.1x VCC bus sense | PA3 | ADC input |
+| USB D- | PA11 | USB_DM |
+| USB D+ | PA12 | USB_DP |
+| Status LED | PC6 | On-board blue LED |
+| User button | PC13 | On-board button |
+| BOOT0 | PB8 | On-board BOOT0 button |
+
+The board has an 8 MHz HSE and 32.768 kHz LSE. Keep USB-C solder bridges in
+their factory state: SB3-SB7 remain open, while SB8/SB9 remain closed. Enabling
+USB-C Power Delivery reserves PA9, PA10, PB2, PB4, and PB6, conflicting with the
+PWM assignment above. Enter ROM DFU by holding BOOT0 while pressing and
+releasing NRST.
+
+Sources: [WeAct schematic and board files](https://github.com/WeActStudio/WeActStudio.STM32G431CoreBoard)
+and [Zephyr board documentation](https://docs.zephyrproject.org/latest/boards/weact/stm32g431_core/doc/index.html).
+
 ## Prepare
 
-### Get docker
+Clone dependencies once before building STM32G4:
 
 ```shell
+make submodules
+# RP2350 Docker image
 docker pull xianii/pico-sdk:latest
 ```
 
@@ -47,14 +84,22 @@ Needs Pico SDK **≥2.0** (RP2350). Image `xianii/pico-sdk:2.3.0` / `latest` is 
 ### build
 
 ```shell
-# build (docker, files owned by your user) → build/src/RP2350_TinyKnob.uf2
+# Default: RP2350 Docker build → build/rp2350/src/RP2350_TinyKnob.uf2
 make
-# remove root-owned build/ from earlier docker runs
-make docker_clean
-# or: make clean  (falls back to docker_clean if build/ is not writable)
-make format
-make rebuild
+make TARGET=rp2350 build       # local Pico SDK build
+make TARGET=rp2350 flash       # copy UF2 to RP2350_MOUNT
+
+# STM32CubeG4 CMSIS/LL + Arm GNU toolchain
+make TARGET=stm32g4 build
+make TARGET=stm32g4 flash      # ROM USB DFU, VID:PID 0483:df11
+
+make TARGET=rp2350 clean
+make TARGET=stm32g4 clean
 ```
+
+The STM32 build emits `.elf`, `.bin`, `.hex`, and `.map` files under
+`build/stm32g4/platforms/stm32g4/`. To flash, connect USB D-/D+, enter the
+STM32 system bootloader using BOOT0/reset, and install `dfu-util`.
 
 For rapid cogging-compensation feel tuning (requires `pyusb` and an auto-mounted
 RP2350 UF2 volume), one command edits the SPIN default scale, builds, flashes, aligns, and
@@ -69,6 +114,7 @@ The script also accepts a device already in UF2 mode. Set `RP2350_MOUNT` for a
 nonstandard mount path. If the volume denies writes, only the `cp` step asks for sudo.
 
 CMake project name: `RP2350_TinyKnob`. Board: `waveshare_rp2350_zero`.
+STM32 CMake project name: `STM32G431_TinyKnob`.
 
 ## Usage
 

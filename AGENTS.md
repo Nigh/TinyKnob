@@ -89,3 +89,21 @@ Exit: `feel_check` `0` ok, `1` fail, `2` warn-only (SPIN rest σ high). Hand: SP
 ## USB identity
 
 `VID=0xACDC` `PID=0x4011` — HelloWorks TinyRoller. Vendor Bulk for telem/commands; CDC for logs. Protocol: `docs/usb-protocol.md`.
+
+## STM32G431CBU6 target
+
+Board: WeAct STM32G431 Core Board QFN48 V1.0. The accepted TinyKnob signal map
+and USB-C solder-bridge conflicts are documented in `README.md`; keep those pins
+consistent when adding drivers. The target is currently a CMSIS/LL build and
+ROM-DFU skeleton only, without motor, encoder, LED, USB device, or FOC behavior.
+
+```shell
+make submodules
+make TARGET=stm32g4 build
+# Put the MCU in its system USB DFU bootloader with BOOT0/reset first.
+make TARGET=stm32g4 flash
+```
+
+Artifacts are under `build/stm32g4/platforms/stm32g4/`. The dependency is pinned
+by the `third_party/STM32CubeG4` gitlink; initialize only its CMSIS Device and
+STM32G4xx HAL Driver nested modules (the latter supplies LL headers).

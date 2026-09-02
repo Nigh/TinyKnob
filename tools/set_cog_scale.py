@@ -18,7 +18,7 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parents[1]
 PINS = ROOT / "src" / "pins.h"
-UF2 = ROOT / "build" / "src" / "RP2350_TinyKnob.uf2"
+UF2 = ROOT / "build" / "rp2350" / "src" / "RP2350_TinyKnob.uf2"
 APP_VID, APP_PID = 0xACDC, 0x4011
 BOOT_VID, BOOT_PID = 0x2E8A, 0x000F
 SCALE_RE = re.compile(r"^(#define SPIN_COG_FF_SCALE )[^ ]+(.*)$", re.MULTILINE)

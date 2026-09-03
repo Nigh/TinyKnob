@@ -119,7 +119,7 @@ static uint8_t ack_status;
 static bool diag_after_ack;
 static bool diag_pending;
 static int16_t duty_a_q15, duty_b_q15, duty_c_q15;
-static volatile uint16_t adc_dma[8];
+static volatile uint16_t adc_dma[4];
 static volatile bool adc_sample_ready;
 static volatile uint32_t adc_sequence;
 static float adc_offset[3];
@@ -133,6 +133,7 @@ static bool test_forward;
 static volatile float iq_ref;
 static float id_integral, iq_integral, ud_out, uq_out, uq_feedforward;
 static bool current_control;
+static uint8_t current_div;
 static bool aligned;
 static int32_t rest_pos, track_pos;
 static bool rest_hold, gear_capture;
@@ -547,7 +548,7 @@ static void adc_dma_init(void) {
 	LL_DMA_ConfigAddresses(DMA1, LL_DMA_CHANNEL_1,
 		LL_ADC_DMA_GetRegAddr(ADC1, LL_ADC_DMA_REG_REGULAR_DATA), (uint32_t)adc_dma,
 		LL_DMA_DIRECTION_PERIPH_TO_MEMORY);
-	LL_DMA_SetDataLength(DMA1, LL_DMA_CHANNEL_1, 8);
+	LL_DMA_SetDataLength(DMA1, LL_DMA_CHANNEL_1, 4);
 	LL_DMA_EnableIT_TC(DMA1, LL_DMA_CHANNEL_1);
 	LL_DMA_EnableIT_TE(DMA1, LL_DMA_CHANNEL_1);
 	NVIC_SetPriority(DMA1_Channel1_IRQn, 2);
@@ -636,8 +637,7 @@ static int16_t to_i16(float value) {
 static void process_adc_sample(void) {
 	if(!adc_sample_ready) return;
 	adc_sample_ready = false;
-	/* DMA TC fires after two four-channel scans: use the newest complete scan. */
-	uint16_t raw[4] = {adc_dma[4], adc_dma[5], adc_dma[6], adc_dma[7]};
+	uint16_t raw[4] = {adc_dma[0], adc_dma[1], adc_dma[2], adc_dma[3]};
 	if(state == STATE_CALIBRATE) {
 		for(uint32_t i = 0; i < 3; i++) adc_offset_sum[i] += raw[i];
 		if(++adc_offset_n >= 256u) {
@@ -672,7 +672,8 @@ static void process_adc_sample(void) {
 	if(fabsf(ia) > I_TRIP_A || fabsf(ib) > I_TRIP_A || fabsf(ic) > I_TRIP_A) {
 		enter_fault("overcurrent"); return;
 	}
-	if(current_control) {
+	if(current_control && ++current_div >= 2u) {
+		current_div = 0;
 		const float dt = 2.f / (float)PWM_HZ;
 		float ed = -id, eq = iq_ref - iq;
 		id_integral += CUR_KI * ed * dt;

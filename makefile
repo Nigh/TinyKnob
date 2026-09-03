@@ -54,7 +54,7 @@ format:
 	bash format.sh
 
 submodules:
-	git submodule update --init third_party/STM32CubeG4
+	git submodule update --init third_party/STM32CubeG4 third_party/tinyusb
 	git -C third_party/STM32CubeG4 submodule update --init \
 		Drivers/CMSIS/Device/ST/STM32G4xx Drivers/STM32G4xx_HAL_Driver
 

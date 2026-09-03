@@ -395,6 +395,9 @@ void TIM1_UP_TIM16_IRQHandler(void) {
 			move_target = test_forward ? home_pos + 16384 : home_pos;
 			state = test_forward ? STATE_TEST_FWD : STATE_TEST_REV;
 			state_ticks = 0;
+			/* Start a fresh stall window for each direction; do not include hold time. */
+			motion_pos0 = enc_pos;
+			motion_ms0 = milliseconds;
 		}
 		break;
 	}

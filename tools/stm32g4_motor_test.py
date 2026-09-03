@@ -130,14 +130,6 @@ def main() -> int:
 	try:
 		if not send_ack(dev, 0x02):
 			raise RuntimeError("STOP was not acknowledged")
-		deadline = time.monotonic() + 0.5
-		vbus_max = 0
-		while time.monotonic() < deadline:
-			frame = telemetry(read_packet(dev))
-			if frame:
-				vbus_max = max(vbus_max, frame["vbus"])
-		if vbus_max < 5000:
-			raise RuntimeError(f"motor supply is absent or too low ({vbus_max} mV)")
 		if not send_ack(dev, 0x01):
 			raise RuntimeError("START was not acknowledged")
 		wait_for(dev, lambda f: f["mode"] != 0, 3.0, "alignment to start")

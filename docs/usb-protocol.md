@@ -41,6 +41,20 @@ All multi-byte fields are **little-endian**.
 
 On Linux with libusb, prefer matching by VID/PID then selecting the interface with `bInterfaceClass == 0xFF`.
 
+### STM32G4 minimal-build compatibility
+
+The `TinyRoller STM32G4` product exposes only the Vendor interface (index 0); it
+does not expose CDC. Endpoints, ACKs, and 25-byte telemetry use the same layouts
+as above. This bring-up build supports only `START` (`0x01`), `STOP` (`0x02`),
+and `TEST` (`0x05`); unsupported commands are rejected with ACK `status=0`.
+Telemetry reports modes IDLE=0, ALIGN=2, TEST=5, and FAULT=8. Id, Iq, Iq_ref,
+and Vbus are zero until synchronized ADC/DMA sensing is implemented. Use
+`tools/stm32g4_motor_test.py` for its guarded align/test/stop sequence.
+For bring-up diagnostics, command `0x30` returns its normal ACK followed by a
+19-byte `0x5C` packet: version, mode, fault code (`1` self-check, `2` encoder
+CRC, `3` encoder stall), raw SSI frame (3 bytes, MSB first), then little-endian
+`u32` counters for CRC OK, CRC failed, and consecutive CRC failed.
+
 ## Telemetry stream (device → host, Bulk IN)
 
 The device pushes fixed **25-byte** frames at about **1 kHz** when the host keeps Bulk IN outstanding and the bus is free. Do not assume a hard realtime guarantee.

@@ -32,6 +32,12 @@
 #define CS_GAIN_V_PER_A 0.3f
 #define CS_SIGN (-1.f)
 #define I_TRIP_A 4.f
+#define ALIGN_RAMP_TICKS (PWM_HZ * 200u / 1000u)
+#define ALIGN_DRAG_TICKS (PWM_HZ * 2500u / 1000u)
+#define ALIGN_HOLD_TICKS (PWM_HZ * 500u / 1000u)
+#define ALIGN_UD 0.75f
+#define ALIGN_DRAG_ELEC_REVS 2.f
+#define ALIGN_DRAG_MIN_COUNTS 400
 #define DIR_PULSE_TICKS (PWM_HZ * 600u / 1000u)
 #define DIR_PULSE_UQ 0.18f
 #define DIR_PULSE_COUNTS 80
@@ -82,6 +88,9 @@ typedef enum {
 	STATE_VERIFY,
 	STATE_CALIBRATE,
 	STATE_ALIGN,
+	STATE_ALIGN_DRAG,
+	STATE_ALIGN_HOLD,
+	STATE_ALIGN_DOWN,
 	STATE_DIR_PULSE,
 	STATE_READY,
 	STATE_TEST_FWD,
@@ -127,7 +136,9 @@ static uint32_t adc_offset_sum[3], adc_offset_n;
 static float ia, ib, ic, id_meas, iq_meas, vbus;
 static uint32_t electrical_offset_phase;
 static int8_t motor_dir = 1;
-static int32_t align_pos, pulse_pos;
+static int32_t align_pos, pulse_pos, align_drag_pos;
+static int64_t align_hold_sum;
+static uint32_t align_hold_n;
 static int32_t home_pos, move_start, move_target;
 static bool test_forward;
 static volatile float iq_ref;
@@ -306,10 +317,38 @@ void TIM1_UP_TIM16_IRQHandler(void) {
 	LL_TIM_ClearFlag_UPDATE(TIM1);
 	state_ticks++;
 	switch(state) {
-	case STATE_ALIGN:
-		apply_voltage(0.08f, 0.f, 0);
-		if(state_ticks >= PWM_HZ / 2u) {
-			align_pos = enc_pos;
+	case STATE_ALIGN: {
+		float k = ALIGN_RAMP_TICKS ? (float)state_ticks / (float)ALIGN_RAMP_TICKS : 1.f;
+		if(k > 1.f) k = 1.f;
+		apply_voltage(ALIGN_UD * k, 0.f, 0);
+		if(state_ticks >= ALIGN_RAMP_TICKS) {
+			align_drag_pos = enc_pos;
+			state_ticks = 0;
+			state = STATE_ALIGN_DRAG;
+		}
+		break;
+	}
+	case STATE_ALIGN_DRAG: {
+		float k = ALIGN_DRAG_TICKS ? (float)state_ticks / (float)ALIGN_DRAG_TICKS : 1.f;
+		if(k > 1.f) k = 1.f;
+		uint32_t forced = phase_from_rad(ALIGN_DRAG_ELEC_REVS * TWO_PI * k);
+		apply_voltage(ALIGN_UD, 0.f, forced);
+		if(state_ticks >= ALIGN_DRAG_TICKS) {
+			int32_t moved = enc_pos - align_drag_pos;
+			if(moved < 0) moved = -moved;
+			if(moved < ALIGN_DRAG_MIN_COUNTS) { enter_fault("align_motion"); break; }
+			align_hold_sum = 0;
+			align_hold_n = 0;
+			state_ticks = 0;
+			state = STATE_ALIGN_HOLD;
+		}
+		break;
+	}
+	case STATE_ALIGN_HOLD:
+		apply_voltage(ALIGN_UD, 0.f, 0);
+		if(state_ticks >= ALIGN_HOLD_TICKS) {
+			if(align_hold_n < 8u) { enter_fault("align_motion"); break; }
+			align_pos = (int32_t)(align_hold_sum / (int64_t)align_hold_n);
 			pulse_pos = enc_pos;
 			state_ticks = 0;
 			state = STATE_DIR_PULSE;
@@ -326,9 +365,17 @@ void TIM1_UP_TIM16_IRQHandler(void) {
 			/* The q-axis direction pulse moves the rotor; zero Park angle at its final position. */
 			int64_t phase = (int64_t)motor_dir * enc_pos * MOTOR_POLE_PAIRS * 262144ll;
 			electrical_offset_phase = (uint32_t)-phase;
+			state_ticks = 0; state = STATE_ALIGN_DOWN;
+		}
+		break;
+	case STATE_ALIGN_DOWN: {
+		float k = state_ticks < ALIGN_RAMP_TICKS ? 1.f - (float)state_ticks / (float)ALIGN_RAMP_TICKS : 0.f;
+		apply_voltage(ALIGN_UD * k, 0.f, 0);
+		if(state_ticks >= ALIGN_RAMP_TICKS) {
 			outputs_off(); aligned = true; state_ticks = 0; state = STATE_READY;
 		}
 		break;
+	}
 	case STATE_TEST_FWD:
 	case STATE_TEST_REV: {
 		uint32_t move = TEST_MOVE_TICKS;
@@ -704,7 +751,8 @@ static uint8_t protocol_mode(void) {
 	if(state == STATE_TEST_FWD || state == STATE_TEST_REV)
 		return 5;
 	if(state == STATE_DIR_PULSE) return 3;
-	if(state == STATE_VERIFY || state == STATE_CALIBRATE || state == STATE_ALIGN)
+	if(state == STATE_VERIFY || state == STATE_CALIBRATE || state == STATE_ALIGN ||
+		state == STATE_ALIGN_DRAG || state == STATE_ALIGN_HOLD || state == STATE_ALIGN_DOWN)
 		return 2;
 	return 0;
 }
@@ -928,6 +976,10 @@ int main(void) {
 			if(sequence != adc_seen) { adc_seen = sequence; adc_stale_ms = 0; }
 			else if(LL_GPIO_IsOutputPinSet(GPIOC, LL_GPIO_PIN_4) && ++adc_stale_ms >= 2u) enter_fault("adc_stale");
 			bool good = encoder_read();
+			if(state == STATE_ALIGN_HOLD && good) {
+				align_hold_sum += enc_pos;
+				align_hold_n++;
+			}
 			if(state == STATE_VERIFY && good && ++verify_good >= 8u) {
 				state = STATE_CALIBRATE; state_ticks = 0; outputs_on();
 			}

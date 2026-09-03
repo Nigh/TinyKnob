@@ -327,6 +327,29 @@ static bool vendor_diag(void) {
 	return true;
 }
 
+__attribute__((noreturn)) static void enter_system_dfu(void) {
+	typedef void (*entry_fn_t)(void);
+	const uint32_t system_memory = 0x1fff0000u;
+	outputs_off();
+	tud_disconnect();
+	delay_cycles(SystemCoreClock / 100u);
+	__disable_irq();
+	SysTick->CTRL = 0;
+	for(uint32_t i = 0; i < 8; i++) {
+		NVIC->ICER[i] = 0xffffffffu;
+		NVIC->ICPR[i] = 0xffffffffu;
+	}
+	LL_RCC_HSI_Enable();
+	while(!LL_RCC_HSI_IsReady()) {}
+	LL_RCC_SetSysClkSource(LL_RCC_SYS_CLKSOURCE_HSI);
+	while(LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_HSI) {}
+	LL_RCC_PLL_Disable();
+	SCB->VTOR = system_memory;
+	__set_MSP(*(uint32_t *)system_memory);
+	((entry_fn_t)*(uint32_t *)(system_memory + 4u))();
+	for(;;) {}
+}
+
 static uint8_t vendor_command(uint8_t cmd) {
 	if(cmd == 0x02) {
 		outputs_off(); state = STATE_DISABLED; fault_reason[0] = 0;
@@ -380,6 +403,7 @@ static void vendor_task(void) {
 	if(tud_vendor_available()) {
 		uint8_t packet[64];
 		uint32_t n = tud_vendor_read(packet, sizeof(packet));
+		if(n && packet[0] == 0x7f) enter_system_dfu();
 		if(n) {
 			ack_cmd = packet[0];
 			ack_status = vendor_command(ack_cmd);

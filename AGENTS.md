@@ -94,8 +94,13 @@ Exit: `feel_check` `0` ok, `1` fail, `2` warn-only (SPIN rest σ high). Hand: SP
 
 Board: WeAct STM32G431 Core Board QFN48 V1.0. The accepted TinyKnob signal map
 and USB-C solder-bridge conflicts are documented in `README.md`; keep those pins
-consistent when adding drivers. The target is currently a CMSIS/LL build and
-ROM-DFU skeleton only, without motor, encoder, LED, USB device, or FOC behavior.
+consistent when adding drivers. The current STM32 build is a CMSIS/LL minimal
+motor test: TinyUSB Vendor Bulk, TIM1 20 kHz three-phase PWM, DWT-timed MT6701 SSI, and a
+fixed 12% open-loop forward/reverse sequence. It has no ADC/current protection;
+use a 12 V / 1 A current-limited bench supply. `START` verifies/alines, `TEST`
+runs continuously, and `STOP`, USB loss, CRC failure, or encoder stall disables
+nSLEEP. Test it with `python3 tools/stm32g4_motor_test.py`; CDC is intentionally
+disabled. Do not add the remaining RP2350 modes before synchronized ADC/DMA bring-up.
 
 ```shell
 make submodules
@@ -106,4 +111,5 @@ make TARGET=stm32g4 flash
 
 Artifacts are under `build/stm32g4/platforms/stm32g4/`. The dependency is pinned
 by the `third_party/STM32CubeG4` gitlink; initialize only its CMSIS Device and
-STM32G4xx HAL Driver nested modules (the latter supplies LL headers).
+STM32G4xx HAL Driver nested modules (the latter supplies LL headers), plus the
+`third_party/tinyusb` gitlink.

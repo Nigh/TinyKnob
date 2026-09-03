@@ -39,7 +39,7 @@ Current path (`pins.h`): `CUR_LOOP_EN=1` uses PWM-timed low-side ADC/DMA telemet
 ### WeAct STM32G431CBU6 mapping
 
 The STM32 target uses the WeAct STM32G431 Core Board QFN48 V1.0 pinout. This is
-the assigned TinyKnob wiring; peripheral drivers are not implemented yet.
+the assigned TinyKnob wiring used by the minimal motor-test firmware.
 
 | TinyKnob function | WeAct pin | STM32 peripheral |
 |---|---|---|
@@ -100,6 +100,36 @@ make TARGET=stm32g4 clean
 The STM32 build emits `.elf`, `.bin`, `.hex`, and `.map` files under
 `build/stm32g4/platforms/stm32g4/`. To flash, connect USB D-/D+, enter the
 STM32 system bootloader using BOOT0/reset, and install `dfu-util`.
+
+### STM32G4 minimal motor test
+
+This first bring-up build has no ADC current sensing or firmware over-current
+protection. Use a current-limited bench supply set to **12 V / 1 A**, keep the
+motor clear, and be ready to remove power. PWM is 20 kHz center-aligned and the
+test voltage command is fixed at 12%.
+
+After flashing, reconnect USB and use the `TinyRoller STM32G4` Vendor Bulk
+interface (OUT `0x01`, IN `0x81`). The minimal build accepts one-byte commands:
+
+- `0x01` `START`: require valid MT6701 CRC frames, apply a 500 ms low-power
+  alignment, then enter `READY` with the driver disabled.
+- `0x05` `TEST`: from `READY`, align again and continuously alternate one slow
+  mechanical revolution forward and reverse with 250 ms pauses.
+- `0x02` `STOP`: immediately disable TIM1 outputs and pull DRV8316 nSLEEP low.
+
+Each command returns the normal 3-byte `0x5A` ACK and IN streams the normal
+25-byte `0xA5` telemetry frame at about 1 kHz. Current and bus-voltage fields are
+zero until ADC/DMA sensing is ported. Run the guarded host test with:
+
+```shell
+source ~/venv/bin/activate
+python3 tools/stm32g4_motor_test.py --seconds 12
+```
+
+USB disconnect/suspend, 20 consecutive MT6701 CRC failures, or less than 128
+encoder counts of movement in 500 ms during a moving leg disables the driver.
+The board LED is solid in `READY`/motion and blinks on `FAULT`. `SPRING`, `SPIN`, `GEAR`, `GOTO`, `STRESS`, current control, and software `UPLOAD`
+remain RP2350-only.
 
 For rapid cogging-compensation feel tuning (requires `pyusb` and an auto-mounted
 RP2350 UF2 volume), one command edits the SPIN default scale, builds, flashes, aligns, and

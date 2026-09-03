@@ -71,6 +71,10 @@
 #define GEAR_CLICK_TICKS 1u
 #define GEAR_D 0.0008f
 #define GEAR_D_UQ_MAX 0.03f
+#define GEAR_CAPTURE_MIN_TICKS (PWM_HZ * 250u / 1000u)
+#define GEAR_CAPTURE_STABLE_TICKS (PWM_HZ * 120u / 1000u)
+#define GEAR_CAPTURE_TIMEOUT_TICKS (PWM_HZ * 1200u / 1000u)
+#define GEAR_CAPTURE_W_MAX 0.10f
 #define SPIN_IQ_CAP 0.20f
 
 typedef enum {
@@ -128,6 +132,10 @@ static bool current_control;
 static uint8_t current_div;
 static bool aligned;
 static int32_t rest_pos, track_pos;
+static bool rest_hold, gear_capture;
+static uint32_t gear_capture_stable;
+static float spring_k = SPRING_K;
+static float spring_cog_scale = 0.1f, spin_cog_scale = 0.65f;
 static float track_velocity, velocity;
 static uint16_t velocity_prev;
 static bool velocity_have;
@@ -214,7 +222,7 @@ static float cog_command(int32_t position) {
 	uint32_t i0 = (uint32_t)wrapped / 16u, i1 = (i0 + 1u) & 1023u;
 	float fraction = (float)(wrapped & 15) * (1.f / 16.f);
 	float value = COG_LUT_FLASH[i0] + (COG_LUT_FLASH[i1] - COG_LUT_FLASH[i0]) * fraction;
-	float scale = state == STATE_GEAR ? 1.f : state == STATE_SPRING ? 0.1f : 0.65f;
+	float scale = state == STATE_GEAR ? 1.f : state == STATE_SPRING ? spring_cog_scale : spin_cog_scale;
 	return scale * value;
 }
 
@@ -244,7 +252,7 @@ static float spring_command(int32_t error_counts) {
 		damping_gain = t * SPRING_WALL_D;
 	}
 	float damping = clampf(damping_gain * neutral * velocity, -SPRING_D_UQ_MAX, SPRING_D_UQ_MAX);
-	return clampf(SPRING_K * spring_error - damping, -envelope, envelope);
+	return clampf(spring_k * spring_error - damping, -envelope, envelope);
 }
 
 static float spin_command(void) {
@@ -351,7 +359,7 @@ void TIM1_UP_TIM16_IRQHandler(void) {
 		if(av > SPIN_W_MAX) {
 			float sign = velocity < 0.f ? -1.f : 1.f;
 			float brake = -sign * clampf((av - SPIN_W_MAX) / SPIN_W_MAX, 0.f, 1.f) * SPIN_IQ_CAP;
-			iq_ref = (float)motor_dir * brake;
+			iq_ref = (float)motor_dir * (brake + cog_command(enc_pos));
 			uq_feedforward = (float)motor_dir * spin_command();
 			current_control = true;
 		} else apply_encoder_voltage(spin_command());
@@ -373,7 +381,15 @@ void TIM1_UP_TIM16_IRQHandler(void) {
 		break;
 	}
 	case STATE_GEAR:
-		apply_encoder_voltage(gear_command());
+		if(gear_capture) {
+			apply_encoder_voltage(0.f); gear_center = (float)enc_pos;
+			if(state_ticks >= GEAR_CAPTURE_MIN_TICKS && fabsf(velocity) <= GEAR_CAPTURE_W_MAX) gear_capture_stable++;
+			else gear_capture_stable = 0;
+			if(gear_capture_stable >= GEAR_CAPTURE_STABLE_TICKS || state_ticks >= GEAR_CAPTURE_TIMEOUT_TICKS) {
+				gear_capture = false; gear_center = (float)enc_pos; gear_cog_center = cog_command(enc_pos);
+				gear_prev_progress = 0.f; gear_click_ticks = 0;
+			}
+		} else apply_encoder_voltage(gear_command());
 		break;
 	default:
 		break;
@@ -589,11 +605,17 @@ static void process_adc_sample(void) {
 		return;
 	}
 	if(adc_offset_n < 256u) return;
-	float sa = CS_SIGN * ((float)raw[0] - adc_offset[0]) * ADC_TO_V / CS_GAIN_V_PER_A;
-	float sb = CS_SIGN * ((float)raw[1] - adc_offset[1]) * ADC_TO_V / CS_GAIN_V_PER_A;
-	float sc = CS_SIGN * ((float)raw[2] - adc_offset[2]) * ADC_TO_V / CS_GAIN_V_PER_A;
-	/* Match the RP2350 validated CS_PHASE_ORD=4 (CAB). */
-	ia = sc; ib = sa; ic = sb;
+	float sa = ((float)raw[0] - adc_offset[0]) * ADC_TO_V / CS_GAIN_V_PER_A;
+	float sb = ((float)raw[1] - adc_offset[1]) * ADC_TO_V / CS_GAIN_V_PER_A;
+	float sc = ((float)raw[2] - adc_offset[2]) * ADC_TO_V / CS_GAIN_V_PER_A;
+	/* DRV8316 datasheet three-shunt cross-coupling correction. */
+	float ca = 0.995832f * sa - 0.028199f * sb - 0.014988f * sc;
+	float cb = 0.037737f * sa + 1.007723f * sb - 0.033757f * sc;
+	float cc = 0.009226f * sa + 0.029805f * sb + 1.003268f * sc;
+	/* Match the RP2350 validated CS_SIGN=-1, CS_PHASE_ORD=4 (CAB). */
+	ia = -cc; ib = -ca; ic = -cb;
+	float common = (ia + ib + ic) * (1.f / 3.f);
+	ia -= common; ib -= common; ic -= common;
 	vbus = (float)raw[3] * ADC_TO_V * 10.f;
 	uint32_t park_phase = encoder_electrical_phase() + phase_from_rad(-0.70f);
 	uint8_t index = (uint8_t)(park_phase >> 24);
@@ -717,7 +739,12 @@ static uint8_t vendor_command(uint8_t const *packet, uint32_t n) {
 	}
 	if(cmd == 0x30) return 1;
 	if(!mode_allowed()) return 0;
-	if(cmd == 0x03) { rest_pos = enc_pos; state_ticks = 0; state = STATE_SPRING; outputs_on(); return 1; }
+	if(cmd == 0x03) {
+		bool capture = !rest_hold;
+		if(capture) rest_pos = enc_pos;
+		rest_hold = false; state_ticks = capture ? 0u : SPRING_SETTLE_TICKS;
+		state = STATE_SPRING; outputs_on(); return 1;
+	}
 	if(cmd == 0x04) { state_ticks = 0; state = STATE_SPIN; outputs_on(); return 1; }
 	if(cmd == 0x05) {
 		home_pos = enc_pos; move_start = enc_pos; move_target = enc_pos + 16384;
@@ -730,7 +757,20 @@ static uint8_t vendor_command(uint8_t const *packet, uint32_t n) {
 		current_reset(); current_control = true; state = STATE_POS; state_ticks = 0; outputs_on(); return 1;
 	}
 	if(cmd == 0x07) { stress_phase = 0; state_ticks = 0; state = STATE_STRESS; outputs_on(); return 1; }
-	if(cmd == 0x0a) { gear_center = (float)enc_pos; gear_cog_center = cog_command(enc_pos); gear_prev_progress = 0.f; gear_click_ticks = 0; state_ticks = 0; state = STATE_GEAR; outputs_on(); return 1; }
+	if(cmd == 0x0a) {
+		state = STATE_GEAR; gear_center = (float)enc_pos; gear_cog_center = cog_command(enc_pos); gear_prev_progress = 0.f;
+		gear_click_ticks = 0; gear_capture = true; gear_capture_stable = 0; state_ticks = 0;
+		outputs_on(); return 1;
+	}
+	if(cmd == 0x20) { if(n >= 2u) spring_k = clampf((float)packet[1] / 10.f, 0.f, 8.f); return 1; }
+	if(cmd == 0x21) { rest_pos = enc_pos; rest_hold = true; return 1; }
+	if(cmd == 0x22 && n >= 3u) {
+		float scale = clampf((float)((uint16_t)packet[1] | (uint16_t)packet[2] << 8) / 1000.f, 0.f, 2.f);
+		if(state == STATE_SPRING) spring_cog_scale = scale;
+		else if(state == STATE_SPIN) spin_cog_scale = scale;
+		else return 0;
+		return 1;
+	}
 	return 0;
 }
 

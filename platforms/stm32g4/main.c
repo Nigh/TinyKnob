@@ -769,7 +769,8 @@ __attribute__((noreturn)) static void jump_system_dfu(void) {
 __attribute__((noreturn)) static void request_system_dfu(void) {
 	outputs_off();
 	tud_disconnect();
-	delay_cycles(SystemCoreClock / 100u);
+	/* Let the host and hub observe detach before the ROM reconnects. */
+	delay_cycles(SystemCoreClock / 4u);
 	dfu_request = DFU_REQUEST_MAGIC;
 	__DSB();
 	NVIC_SystemReset();

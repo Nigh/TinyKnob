@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the minimal STM32G4 motor test over TinyRoller Vendor Bulk USB."""
+"""Test STM32G4 FOC and motor modes over TinyRoller Vendor Bulk USB."""
 from __future__ import annotations
 
 import argparse
@@ -55,8 +55,8 @@ def read_packet(dev, timeout_ms=100):
 		return None
 
 
-def send_ack(dev, cmd: int, timeout_s=1.0) -> bool:
-	dev.write(EP_OUT, bytes([cmd]), timeout=1000)
+def send_ack(dev, cmd: int, *payload: int, timeout_s=1.0) -> bool:
+	dev.write(EP_OUT, bytes([cmd, *payload]), timeout=1000)
 	deadline = time.monotonic() + timeout_s
 	while time.monotonic() < deadline:
 		packet = read_packet(dev)
@@ -111,9 +111,16 @@ def main() -> int:
 	parser = argparse.ArgumentParser(description=__doc__)
 	parser.add_argument("--seconds", type=float, default=12.0,
 		help="observe TEST motion for this many seconds (default: 12)")
+	parser.add_argument("--all-modes", action="store_true", help="also smoke-test SPRING, SPIN, POS, STRESS, and GEAR")
+	parser.add_argument("--bootloader", action="store_true", help="send 0x7F and exit; device should enumerate as 0483:DF11")
 	args = parser.parse_args()
 	dev, intf = open_device()
 	print(f"connected: {PRODUCT}, vendor interface {intf}, OUT 0x01 / IN 0x81")
+	if args.bootloader:
+		dev.write(EP_OUT, b"\x7f", timeout=1000)
+		print("BOOTLOADER sent; check for STM32 DFU VID:PID 0483:DF11")
+		usb.util.dispose_resources(dev)
+		return 0
 	try:
 		if not send_ack(dev, 0x02):
 			raise RuntimeError("STOP was not acknowledged")
@@ -126,13 +133,14 @@ def main() -> int:
 			raise RuntimeError("TEST was rejected")
 
 		deadline = time.monotonic() + args.seconds
-		angles, frames, test_frames = [], 0, 0
+		angles, samples, frames, test_frames = [], [], 0, 0
 		while time.monotonic() < deadline:
 			frame = telemetry(read_packet(dev))
 			if not frame:
 				continue
 			frames += 1
 			angles.append(frame["angle"])
+			samples.append(frame)
 			test_frames += frame["mode"] == 5
 		span = max(angles) - min(angles) if angles else 0
 		rate = frames / args.seconds
@@ -141,7 +149,28 @@ def main() -> int:
 			raise RuntimeError("no TEST telemetry received")
 		if span < 500:
 			raise RuntimeError("encoder movement too small (<500 mrad)")
-		print("PASS: Vendor Bulk command, telemetry, and encoder motion verified")
+		active = [f for f in samples if abs(f["iq_ref"]) >= 100]
+		match = sum((f["iq"] > 0) == (f["iq_ref"] > 0) for f in active) / len(active) if active else 0.0
+		if not active or match < 0.70:
+			raise RuntimeError(f"current-loop sign match too low ({match:.1%})")
+		if max((f["vbus"] for f in samples), default=0) < 1000:
+			raise RuntimeError("Vbus telemetry is missing")
+		print(f"current-loop sign match: {match:.1%}")
+		if args.all_modes:
+			for cmd, mode, name, hold in ((0x03, 6, "SPRING", 2.5), (0x04, 7, "SPIN", 1.0)):
+				if not send_ack(dev, cmd): raise RuntimeError(f"{name} rejected")
+				wait_for(dev, lambda f, m=mode: f["mode"] == m, 1.0, name)
+				time.sleep(hold)
+			if not send_ack(dev, 0x02): raise RuntimeError("STOP before POS failed")
+			angle = angles[-1] + 300
+			dev.write(EP_OUT, b"\x06" + struct.pack("<i", angle), timeout=1000)
+			wait_for(dev, lambda f: f["mode"] == 9, 1.0, "POS")
+			for cmd, mode, name, hold in ((0x07, 10, "STRESS", 1.0), (0x0A, 12, "GEAR", 1.5)):
+				if not send_ack(dev, cmd): raise RuntimeError(f"{name} rejected")
+				wait_for(dev, lambda f, m=mode: f["mode"] == m, 1.0, name)
+				time.sleep(hold)
+			print("all requested modes entered successfully")
+		print("PASS: Vendor Bulk, FOC telemetry, current loop, and encoder motion verified")
 		return 0
 	except (RuntimeError, usb.core.USBError) as exc:
 		print(f"FAIL: {exc}", file=sys.stderr)

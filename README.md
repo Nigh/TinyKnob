@@ -101,35 +101,30 @@ The STM32 build emits `.elf`, `.bin`, `.hex`, and `.map` files under
 `build/stm32g4/platforms/stm32g4/`. To flash, connect USB D-/D+, enter the
 STM32 system bootloader using BOOT0/reset, and install `dfu-util`.
 
-### STM32G4 minimal motor test
+### STM32G4 FOC motor test
 
-This first bring-up build has no ADC current sensing or firmware over-current
-protection. Use a current-limited bench supply set to **12 V / 1 A**, keep the
-motor clear, and be ready to remove power. PWM is 20 kHz center-aligned and the
-test voltage command is fixed at 12%.
+The STM32G4 target uses TIM1 20 kHz center-aligned PWM and TIM1-TRGO2-triggered
+ADC1 DMA sampling of all three DRV8316 current-sense outputs plus Vbus. The d/q
+current PI runs at 10 kHz. START performs CSA offset calibration, rotor alignment,
+direction detection, and electrical-zero calibration before returning to IDLE.
 
-After flashing, reconnect USB and use the `TinyRoller STM32G4` Vendor Bulk
-interface (OUT `0x01`, IN `0x81`). The minimal build accepts one-byte commands:
+It uses the same Vendor Bulk endpoints and commands as RP2350 for STOP, START,
+TEST, SPRING, SPIN, GOTO/POS, STRESS, GEAR, SET_K, SET_REST, SET_COG_SCALE, and
+UPLOAD. `UPLOAD` (`0x7F`) disconnects the application and enters the STM32 ROM
+USB DFU bootloader (`0483:DF11`). CDC is intentionally disabled.
 
-- `0x01` `START`: require valid MT6701 CRC frames, apply a 500 ms low-power
-  alignment, then enter `READY` with the driver disabled.
-- `0x05` `TEST`: from `READY`, align again and continuously alternate one slow
-  mechanical revolution forward and reverse with 250 ms pauses.
-- `0x02` `STOP`: immediately disable TIM1 outputs and pull DRV8316 nSLEEP low.
-
-Each command returns the normal 3-byte `0x5A` ACK and IN streams the normal
-25-byte `0xA5` telemetry frame at about 1 kHz. Current and bus-voltage fields are
-zero until ADC/DMA sensing is ported. Run the guarded host test with:
+Use a current-limited supply for initial validation:
 
 ```shell
 source ~/venv/bin/activate
 python3 tools/stm32g4_motor_test.py --seconds 12
+python3 tools/stm32g4_motor_test.py --all-modes
+python3 tools/stm32g4_motor_test.py --bootloader
 ```
 
-USB disconnect/suspend, 20 consecutive MT6701 CRC failures, or less than 128
-encoder counts of movement in 500 ms during a moving leg disables the driver.
-The board LED is solid in `READY`/motion and blinks on `FAULT`. `SPRING`, `SPIN`, `GEAR`, `GOTO`, `STRESS`, current control, and software `UPLOAD`
-remain RP2350-only.
+The test checks Bulk ACK/telemetry, encoder motion, Vbus measurement, and the sign
+agreement between Iq and Iq_ref. CRC failure, alignment motion failure, measured
+phase current above 4 A, encoder stall, USB loss, or suspend disables the driver.
 
 For rapid cogging-compensation feel tuning (requires `pyusb` and an auto-mounted
 RP2350 UF2 volume), one command edits the SPIN default scale, builds, flashes, aligns, and

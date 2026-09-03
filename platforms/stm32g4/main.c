@@ -34,6 +34,15 @@
 #define DIR_PULSE_TICKS (PWM_HZ * 600u / 1000u)
 #define DIR_PULSE_UQ 0.18f
 #define DIR_PULSE_COUNTS 80
+#define POS_KP 0.6f
+#define TEST_KV 0.07f
+#define TEST_UQ_MAX 0.65f
+#define TEST_MOVE_TICKS (PWM_HZ * 1400u / 1000u)
+#define TEST_HOLD_TICKS (PWM_HZ * 200u / 1000u)
+#define CUR_KP 0.25f
+#define CUR_KI 400.f
+#define CUR_KAW 1000.f
+#define CUR_U_MAX 0.60f
 
 typedef enum {
 	STATE_DISABLED,
@@ -81,6 +90,12 @@ static float ia, ib, ic, id_meas, iq_meas, vbus;
 static float electrical_offset;
 static int8_t motor_dir = 1;
 static int32_t align_pos, pulse_pos;
+static int32_t home_pos, move_start, move_target;
+static bool test_forward;
+static volatile float iq_ref;
+static float id_integral, iq_integral, ud_out, uq_out;
+static bool current_control;
+static uint8_t current_div;
 
 static void delay_cycles(uint32_t cycles);
 
@@ -129,6 +144,24 @@ static void enter_fault(char const *reason) {
 	fault_reason[sizeof(fault_reason) - 1u] = 0;
 }
 
+static float clampf(float x, float lo, float hi) {
+	return x < lo ? lo : x > hi ? hi : x;
+}
+
+static float smoothstep5(float t) {
+	t = clampf(t, 0.f, 1.f);
+	float t2 = t * t, t3 = t2 * t;
+	return 10.f * t3 - 15.f * t3 * t + 6.f * t3 * t2;
+}
+
+static uint32_t phase_from_rad(float radians) {
+	return (uint32_t)(int64_t)(radians * (4294967296.0f / TWO_PI));
+}
+
+static void current_reset(void) {
+	iq_ref = 0.f; id_integral = 0.f; iq_integral = 0.f; ud_out = 0.f; uq_out = 0.f;
+}
+
 void SysTick_Handler(void) { milliseconds++; }
 void USB_HP_IRQHandler(void) { tud_int_handler(0); }
 void USB_LP_IRQHandler(void) { tud_int_handler(0); }
@@ -168,21 +201,27 @@ void TIM1_UP_TIM16_IRQHandler(void) {
 		}
 		break;
 	case STATE_TEST_FWD:
-		phase_q32 += PHASE_STEP;
-		apply_voltage(0.f, 0.12f, phase_q32);
-		if(state_ticks >= TEST_TICKS) { state = STATE_TEST_PAUSE_FWD; state_ticks = 0; set_duty(.5f,.5f,.5f); }
+	case STATE_TEST_REV: {
+		uint32_t move = TEST_MOVE_TICKS;
+		float t = state_ticks < move ? (float)state_ticks / (float)move : 1.f;
+		float s5 = smoothstep5(t);
+		float dsdt = t > 0.f && t < 1.f ? 30.f * t * t * (1.f - t) * (1.f - t) : 0.f;
+		int32_t span = move_target - move_start;
+		int32_t target = move_start + (int32_t)((float)span * s5);
+		float err = (float)(target - enc_pos) * (TWO_PI / 16384.f);
+		float omega = (float)span * (TWO_PI / 16384.f) * dsdt * (float)PWM_HZ / (float)move;
+		float outer = clampf(err * POS_KP + TEST_KV * omega, -TEST_UQ_MAX, TEST_UQ_MAX);
+		iq_ref = (float)motor_dir * outer;
+		current_control = true;
+		if(state_ticks >= move + TEST_HOLD_TICKS) {
+			test_forward = !test_forward;
+			move_start = enc_pos;
+			move_target = test_forward ? home_pos + 16384 : home_pos;
+			state = test_forward ? STATE_TEST_FWD : STATE_TEST_REV;
+			state_ticks = 0;
+		}
 		break;
-	case STATE_TEST_PAUSE_FWD:
-		if(state_ticks >= PAUSE_TICKS) { state = STATE_TEST_REV; state_ticks = 0; motion_pos0 = enc_pos; motion_ms0 = milliseconds; }
-		break;
-	case STATE_TEST_REV:
-		phase_q32 -= PHASE_STEP;
-		apply_voltage(0.f, 0.12f, phase_q32);
-		if(state_ticks >= TEST_TICKS) { state = STATE_TEST_PAUSE_REV; state_ticks = 0; set_duty(.5f,.5f,.5f); }
-		break;
-	case STATE_TEST_PAUSE_REV:
-		if(state_ticks >= PAUSE_TICKS) { state = STATE_TEST_FWD; state_ticks = 0; motion_pos0 = enc_pos; motion_ms0 = milliseconds; }
-		break;
+	}
 	default:
 		break;
 	}
@@ -405,8 +444,27 @@ static void process_adc_sample(void) {
 	const float lp = 0.04712389f; /* 150 Hz at 20 kHz sampling. */
 	id_meas += lp * (id - id_meas);
 	iq_meas += lp * (iq - iq_meas);
-	if(fabsf(ia) > I_TRIP_A || fabsf(ib) > I_TRIP_A || fabsf(ic) > I_TRIP_A)
-		enter_fault("overcurrent");
+	if(fabsf(ia) > I_TRIP_A || fabsf(ib) > I_TRIP_A || fabsf(ic) > I_TRIP_A) {
+		enter_fault("overcurrent"); return;
+	}
+	if(current_control && ++current_div >= 2u) {
+		current_div = 0;
+		const float dt = 2.f / (float)PWM_HZ;
+		float ed = -id, eq = iq_ref - iq;
+		id_integral += CUR_KI * ed * dt;
+		iq_integral += CUR_KI * eq * dt;
+		float ud_raw = CUR_KP * ed + id_integral;
+		float uq_raw = CUR_KP * eq + iq_integral;
+		float mag2 = ud_raw * ud_raw + uq_raw * uq_raw;
+		ud_out = ud_raw; uq_out = uq_raw;
+		if(mag2 > CUR_U_MAX * CUR_U_MAX) {
+			float scale = CUR_U_MAX / sqrtf(mag2);
+			ud_out *= scale; uq_out *= scale;
+		}
+		id_integral = clampf(id_integral + CUR_KAW * (ud_out - ud_raw) * dt, -CUR_U_MAX, CUR_U_MAX);
+		iq_integral = clampf(iq_integral + CUR_KAW * (uq_out - uq_raw) * dt, -CUR_U_MAX, CUR_U_MAX);
+		apply_voltage(ud_out, uq_out, phase_from_rad(te));
+	}
 }
 
 static uint8_t protocol_mode(void) {
@@ -477,7 +535,7 @@ __attribute__((noreturn)) static void enter_system_dfu(void) {
 
 static uint8_t vendor_command(uint8_t cmd) {
 	if(cmd == 0x02) {
-		outputs_off(); state = STATE_DISABLED; fault_reason[0] = 0;
+		outputs_off(); current_control = false; current_reset(); state = STATE_DISABLED; fault_reason[0] = 0;
 		return 1;
 	}
 	if(cmd == 0x01) {
@@ -487,7 +545,9 @@ static uint8_t vendor_command(uint8_t cmd) {
 	}
 	if(cmd == 0x05) {
 		if(state != STATE_READY) return 0;
-		state = STATE_TEST_FWD; state_ticks = 0; phase_q32 = 0;
+		home_pos = enc_pos; move_start = enc_pos; move_target = enc_pos + 16384;
+		test_forward = true; current_reset(); current_control = true;
+		state = STATE_TEST_FWD; state_ticks = 0;
 		motion_pos0 = enc_pos; motion_ms0 = milliseconds; outputs_on();
 		return 1;
 	}
@@ -499,7 +559,7 @@ static void vendor_telem(void) {
 	static uint16_t seq;
 	if(!tud_vendor_mounted() || tud_vendor_write_available() < 25) return;
 	int32_t angle_mrad = (int32_t)(((int64_t)enc_pos * 6283) / 16384);
-	int16_t uq_q15 = state == STATE_TEST_FWD ? 3932 : state == STATE_TEST_REV ? -3932 : 0;
+	int16_t uq_q15 = to_i16(uq_out * 32767.f);
 	int8_t dir = state == STATE_TEST_REV ? -1 : 1;
 	uint8_t p[25] = {0};
 	p[0] = 0xa5; p[1] = protocol_mode();
@@ -513,6 +573,8 @@ static void vendor_telem(void) {
 	uint16_t vbus_mv = vbus <= 0.f ? 0u : vbus >= 65.535f ? 65535u : (uint16_t)(vbus * 1000.f);
 	p[14] = (uint8_t)id_ma; p[15] = (uint8_t)(id_ma >> 8);
 	p[16] = (uint8_t)iq_ma; p[17] = (uint8_t)(iq_ma >> 8);
+	int16_t iq_ref_ma = to_i16(iq_ref * 1000.f);
+	p[18] = (uint8_t)iq_ref_ma; p[19] = (uint8_t)(iq_ref_ma >> 8);
 	p[20] = (uint8_t)vbus_mv; p[21] = (uint8_t)(vbus_mv >> 8);
 	p[22] = (uint8_t)uq_q15; p[23] = (uint8_t)(uq_q15 >> 8); p[24] = (uint8_t)dir;
 	seq++;
@@ -559,9 +621,9 @@ int main(void) {
 	clock_init();
 	gpio_init();
 	outputs_off();
+	for(uint32_t i = 0; i < SIN_N; i++) sin_lut[i] = sinf((float)i * TWO_PI / SIN_N);
 	timer_init();
 	adc_dma_init();
-	for(uint32_t i = 0; i < SIN_N; i++) sin_lut[i] = sinf((float)i * TWO_PI / SIN_N);
 	usb_init();
 	if(crc6(0) != 0 || crc6(1) != 0x03 || crc6(0x3ffffu) != 0x0e)
 		enter_fault("crc_selfcheck");

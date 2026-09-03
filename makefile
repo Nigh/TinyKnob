@@ -37,7 +37,7 @@ ifeq ($(TARGET),rp2350)
 	sync
 else
 	@command -v dfu-util >/dev/null || { echo "dfu-util is required" >&2; exit 1; }
-	dfu-util -d 0483:df11 -a 0 -s $(STM32_DFU_ADDRESS):leave \
+	dfu-util -d 0483:df11 -a 0 -R -s $(STM32_DFU_ADDRESS):leave \
 		-D $(BUILD_DIR)/platforms/stm32g4/STM32G431_TinyKnob.bin
 endif
 

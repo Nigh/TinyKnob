@@ -118,9 +118,15 @@ def main() -> int:
 	print(f"connected: {PRODUCT}, vendor interface {intf}, OUT 0x01 / IN 0x81")
 	if args.bootloader:
 		dev.write(EP_OUT, b"\x7f", timeout=1000)
-		print("BOOTLOADER sent; check for STM32 DFU VID:PID 0483:DF11")
 		usb.util.dispose_resources(dev)
-		return 0
+		deadline = time.monotonic() + 5.0
+		while time.monotonic() < deadline:
+			if usb.core.find(idVendor=0x0483, idProduct=0xDF11) is not None:
+				print("PASS: STM32 ROM DFU enumerated as 0483:DF11")
+				return 0
+			time.sleep(0.1)
+		print("FAIL: STM32 ROM DFU did not enumerate as 0483:DF11", file=sys.stderr)
+		return 1
 	try:
 		if not send_ack(dev, 0x02):
 			raise RuntimeError("STOP was not acknowledged")

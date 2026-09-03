@@ -6,6 +6,8 @@
 
 #include "stm32g4xx.h"
 #include "stm32g4xx_ll_bus.h"
+#include "stm32g4xx_ll_adc.h"
+#include "stm32g4xx_ll_dma.h"
 #include "stm32g4xx_ll_system.h"
 #include "stm32g4xx_ll_gpio.h"
 #include "stm32g4xx_ll_pwr.h"
@@ -24,6 +26,7 @@
 #define CRC_FAIL_TRIP 20u
 #define SIN_N 256u
 #define TWO_PI 6.28318530718f
+#define ADC_SAMPLE_POINT ((PWM_TOP * 94u) / 100u)
 
 typedef enum {
 	STATE_DISABLED,
@@ -61,10 +64,13 @@ static uint8_t ack_status;
 static bool diag_after_ack;
 static bool diag_pending;
 static int16_t duty_a_q15, duty_b_q15, duty_c_q15;
+static volatile uint16_t adc_dma[4];
+static volatile bool adc_sample_ready;
+
+static void delay_cycles(uint32_t cycles);
 
 static void outputs_off(void) {
 	LL_TIM_DisableAllOutputs(TIM1);
-	LL_TIM_DisableCounter(TIM1);
 	LL_GPIO_ResetOutputPin(GPIOC, LL_GPIO_PIN_4);
 }
 
@@ -111,6 +117,13 @@ static void enter_fault(char const *reason) {
 void SysTick_Handler(void) { milliseconds++; }
 void USB_HP_IRQHandler(void) { tud_int_handler(0); }
 void USB_LP_IRQHandler(void) { tud_int_handler(0); }
+void DMA1_Channel1_IRQHandler(void) {
+	if(LL_DMA_IsActiveFlag_TC1(DMA1)) {
+		LL_DMA_ClearFlag_TC1(DMA1);
+		adc_sample_ready = true;
+	}
+	if(LL_DMA_IsActiveFlag_TE1(DMA1)) LL_DMA_ClearFlag_TE1(DMA1);
+}
 
 void TIM1_UP_TIM16_IRQHandler(void) {
 	if(!LL_TIM_IsActiveFlag_UPDATE(TIM1)) return;
@@ -216,15 +229,62 @@ static void timer_init(void) {
 	LL_TIM_OC_EnablePreload(TIM1, LL_TIM_CHANNEL_CH1);
 	LL_TIM_OC_EnablePreload(TIM1, LL_TIM_CHANNEL_CH2);
 	LL_TIM_OC_EnablePreload(TIM1, LL_TIM_CHANNEL_CH3);
+	LL_TIM_OC_EnablePreload(TIM1, LL_TIM_CHANNEL_CH4);
 	LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH1, LL_TIM_OCMODE_PWM1);
 	LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH2, LL_TIM_OCMODE_PWM1);
 	LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH3, LL_TIM_OCMODE_PWM1);
+	LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH4, LL_TIM_OCMODE_PWM2);
+	LL_TIM_OC_SetCompareCH4(TIM1, ADC_SAMPLE_POINT);
+	LL_TIM_SetTriggerOutput2(TIM1, LL_TIM_TRGO2_OC4);
 	LL_TIM_CC_EnableChannel(TIM1, LL_TIM_CHANNEL_CH1 | LL_TIM_CHANNEL_CH2 | LL_TIM_CHANNEL_CH3);
 	LL_TIM_GenerateEvent_UPDATE(TIM1);
 	LL_TIM_ClearFlag_UPDATE(TIM1);
 	LL_TIM_EnableIT_UPDATE(TIM1);
 	NVIC_SetPriority(TIM1_UP_TIM16_IRQn, 3);
 	NVIC_EnableIRQ(TIM1_UP_TIM16_IRQn);
+	LL_TIM_EnableCounter(TIM1);
+}
+
+static void adc_dma_init(void) {
+	LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_DMA1);
+	LL_AHB2_GRP1_EnableClock(LL_AHB2_GRP1_PERIPH_ADC12);
+	LL_RCC_SetADCClockSource(LL_RCC_ADC12_CLKSOURCE_SYSCLK);
+	for(uint32_t pin = LL_GPIO_PIN_0; pin <= LL_GPIO_PIN_3; pin <<= 1)
+		LL_GPIO_SetPinMode(GPIOA, pin, LL_GPIO_MODE_ANALOG);
+	LL_ADC_SetCommonClock(__LL_ADC_COMMON_INSTANCE(ADC1), LL_ADC_CLOCK_SYNC_PCLK_DIV4);
+	LL_ADC_DisableDeepPowerDown(ADC1);
+	LL_ADC_EnableInternalRegulator(ADC1);
+	delay_cycles(SystemCoreClock / 50000u);
+	LL_ADC_StartCalibration(ADC1, LL_ADC_SINGLE_ENDED);
+	while(LL_ADC_IsCalibrationOnGoing(ADC1)) {}
+	LL_ADC_REG_SetSequencerLength(ADC1, LL_ADC_REG_SEQ_SCAN_ENABLE_4RANKS);
+	LL_ADC_REG_SetSequencerRanks(ADC1, LL_ADC_REG_RANK_1, LL_ADC_CHANNEL_1);
+	LL_ADC_REG_SetSequencerRanks(ADC1, LL_ADC_REG_RANK_2, LL_ADC_CHANNEL_2);
+	LL_ADC_REG_SetSequencerRanks(ADC1, LL_ADC_REG_RANK_3, LL_ADC_CHANNEL_3);
+	LL_ADC_REG_SetSequencerRanks(ADC1, LL_ADC_REG_RANK_4, LL_ADC_CHANNEL_4);
+	LL_ADC_SetChannelSamplingTime(ADC1, LL_ADC_CHANNEL_1, LL_ADC_SAMPLINGTIME_12CYCLES_5);
+	LL_ADC_SetChannelSamplingTime(ADC1, LL_ADC_CHANNEL_2, LL_ADC_SAMPLINGTIME_12CYCLES_5);
+	LL_ADC_SetChannelSamplingTime(ADC1, LL_ADC_CHANNEL_3, LL_ADC_SAMPLINGTIME_12CYCLES_5);
+	LL_ADC_SetChannelSamplingTime(ADC1, LL_ADC_CHANNEL_4, LL_ADC_SAMPLINGTIME_12CYCLES_5);
+	LL_ADC_REG_SetTriggerSource(ADC1, LL_ADC_REG_TRIG_EXT_TIM1_TRGO2);
+	LL_ADC_REG_SetTriggerEdge(ADC1, LL_ADC_REG_TRIG_EXT_RISING);
+	LL_ADC_REG_SetDMATransfer(ADC1, LL_ADC_REG_DMA_TRANSFER_UNLIMITED);
+	LL_DMA_SetPeriphRequest(DMA1, LL_DMA_CHANNEL_1, LL_DMAMUX_REQ_ADC1);
+	LL_DMA_ConfigTransfer(DMA1, LL_DMA_CHANNEL_1, LL_DMA_DIRECTION_PERIPH_TO_MEMORY |
+		LL_DMA_MODE_CIRCULAR | LL_DMA_PERIPH_NOINCREMENT | LL_DMA_MEMORY_INCREMENT |
+		LL_DMA_PDATAALIGN_HALFWORD | LL_DMA_MDATAALIGN_HALFWORD | LL_DMA_PRIORITY_HIGH);
+	LL_DMA_ConfigAddresses(DMA1, LL_DMA_CHANNEL_1,
+		LL_ADC_DMA_GetRegAddr(ADC1, LL_ADC_DMA_REG_REGULAR_DATA), (uint32_t)adc_dma,
+		LL_DMA_DIRECTION_PERIPH_TO_MEMORY);
+	LL_DMA_SetDataLength(DMA1, LL_DMA_CHANNEL_1, 4);
+	LL_DMA_EnableIT_TC(DMA1, LL_DMA_CHANNEL_1);
+	LL_DMA_EnableIT_TE(DMA1, LL_DMA_CHANNEL_1);
+	NVIC_SetPriority(DMA1_Channel1_IRQn, 2);
+	NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+	LL_DMA_EnableChannel(DMA1, LL_DMA_CHANNEL_1);
+	LL_ADC_Enable(ADC1);
+	while(!LL_ADC_IsActiveFlag_ADRDY(ADC1)) {}
+	LL_ADC_REG_StartConversion(ADC1);
 }
 
 static void usb_init(void) {
@@ -428,6 +488,7 @@ int main(void) {
 	gpio_init();
 	outputs_off();
 	timer_init();
+	adc_dma_init();
 	for(uint32_t i = 0; i < SIN_N; i++) sin_lut[i] = sinf((float)i * TWO_PI / SIN_N);
 	usb_init();
 	if(crc6(0) != 0 || crc6(1) != 0x03 || crc6(0x3ffffu) != 0x0e)

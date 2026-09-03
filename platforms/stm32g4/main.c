@@ -742,13 +742,26 @@ static bool vendor_diag(void) {
 __attribute__((noreturn)) static void jump_system_dfu(void) {
 	typedef void (*entry_fn_t)(void);
 	const uint32_t system_memory = 0x1fff0000u;
+	uint32_t stack = *(uint32_t *)system_memory;
+	entry_fn_t entry = (entry_fn_t)*(uint32_t *)(system_memory + 4u);
 	__disable_irq();
 	SysTick->CTRL = 0;
-	SCB->VTOR = system_memory;
+	SysTick->LOAD = 0;
+	SysTick->VAL = 0;
+	SCB->ICSR = SCB_ICSR_PENDSTCLR_Msk | SCB_ICSR_PENDSVCLR_Msk;
+	for(uint32_t i = 0; i < 8u; i++) {
+		NVIC->ICER[i] = 0xffffffffu;
+		NVIC->ICPR[i] = 0xffffffffu;
+	}
+	LL_APB2_GRP1_EnableClock(LL_APB2_GRP1_PERIPH_SYSCFG);
+	LL_SYSCFG_SetRemapMemory(LL_SYSCFG_REMAP_SYSTEMFLASH);
+	SCB->VTOR = 0;
 	__set_CONTROL(0);
-	__set_MSP(*(uint32_t *)system_memory);
-	__DSB(); __ISB();
-	((entry_fn_t)*(uint32_t *)(system_memory + 4u))();
+	__set_MSP(stack);
+	__DSB();
+	__ISB();
+	__enable_irq();
+	entry();
 	for(;;) {}
 }
 
@@ -858,6 +871,7 @@ static void vendor_task(void) {
 	if(tud_vendor_available()) {
 		uint8_t packet[64];
 		uint32_t n = tud_vendor_read(packet, sizeof(packet));
+		if(n) tud_vendor_write_clear();
 		if(n && packet[0] == 0x7f) request_system_dfu();
 		if(n) {
 			ack_cmd = packet[0];
@@ -913,7 +927,8 @@ int main(void) {
 			if(state == STATE_VERIFY && good && ++verify_good >= 8u) {
 				state = STATE_CALIBRATE; state_ticks = 0; outputs_on();
 			}
-			if((state == STATE_TEST_FWD || state == STATE_TEST_REV) && now - motion_ms0 >= ENCODER_STALL_MS) {
+			if((state == STATE_TEST_FWD || state == STATE_TEST_REV) && state_ticks < TEST_MOVE_TICKS &&
+				now - motion_ms0 >= ENCODER_STALL_MS) {
 				int32_t moved = enc_pos - motion_pos0; if(moved < 0) moved = -moved;
 				if(moved < ENCODER_STALL_COUNTS) enter_fault("encoder_stall");
 				else { motion_pos0 = enc_pos; motion_ms0 = now; }

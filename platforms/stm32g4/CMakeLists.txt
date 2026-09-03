@@ -51,6 +51,9 @@ set(VENDOR_LINKER_SCRIPT
 # ponytail: CubeG4 v1.6.3 emits GCC 11's READONLY syntax; strip only that marker for GCC 9+.
 file(READ "${VENDOR_LINKER_SCRIPT}" LINKER_SCRIPT_CONTENT)
 string(REPLACE " (READONLY)" "" LINKER_SCRIPT_CONTENT "${LINKER_SCRIPT_CONTENT}")
+# Keep the software-DFU request across NVIC_SystemReset without consuming backup domain state.
+string(REPLACE ".ARM.attributes 0 :" ".noinit (NOLOAD) : { *(.noinit*) } >RAM\n  .ARM.attributes 0 :"
+	LINKER_SCRIPT_CONTENT "${LINKER_SCRIPT_CONTENT}")
 set(LINKER_SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/STM32G431CBU6_FLASH.ld")
 file(WRITE "${LINKER_SCRIPT}" "${LINKER_SCRIPT_CONTENT}")
 target_link_options(${PROJECT_NAME} PRIVATE

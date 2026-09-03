@@ -94,6 +94,9 @@ typedef enum {
 	STATE_FAULT,
 } test_state_t;
 
+#define DFU_REQUEST_MAGIC 0x44465531u
+__attribute__((section(".noinit.dfu"))) static volatile uint32_t dfu_request;
+
 static volatile uint32_t milliseconds;
 static volatile test_state_t state;
 static volatile uint32_t state_ticks;
@@ -700,26 +703,26 @@ static bool vendor_diag(void) {
 	return true;
 }
 
-__attribute__((noreturn)) static void enter_system_dfu(void) {
+__attribute__((noreturn)) static void jump_system_dfu(void) {
 	typedef void (*entry_fn_t)(void);
 	const uint32_t system_memory = 0x1fff0000u;
+	__disable_irq();
+	SysTick->CTRL = 0;
+	SCB->VTOR = system_memory;
+	__set_CONTROL(0);
+	__set_MSP(*(uint32_t *)system_memory);
+	__DSB(); __ISB();
+	((entry_fn_t)*(uint32_t *)(system_memory + 4u))();
+	for(;;) {}
+}
+
+__attribute__((noreturn)) static void request_system_dfu(void) {
 	outputs_off();
 	tud_disconnect();
 	delay_cycles(SystemCoreClock / 100u);
-	__disable_irq();
-	SysTick->CTRL = 0;
-	for(uint32_t i = 0; i < 8; i++) {
-		NVIC->ICER[i] = 0xffffffffu;
-		NVIC->ICPR[i] = 0xffffffffu;
-	}
-	LL_RCC_HSI_Enable();
-	while(!LL_RCC_HSI_IsReady()) {}
-	LL_RCC_SetSysClkSource(LL_RCC_SYS_CLKSOURCE_HSI);
-	while(LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_HSI) {}
-	LL_RCC_PLL_Disable();
-	SCB->VTOR = system_memory;
-	__set_MSP(*(uint32_t *)system_memory);
-	((entry_fn_t)*(uint32_t *)(system_memory + 4u))();
+	dfu_request = DFU_REQUEST_MAGIC;
+	__DSB();
+	NVIC_SystemReset();
 	for(;;) {}
 }
 
@@ -819,7 +822,7 @@ static void vendor_task(void) {
 	if(tud_vendor_available()) {
 		uint8_t packet[64];
 		uint32_t n = tud_vendor_read(packet, sizeof(packet));
-		if(n && packet[0] == 0x7f) enter_system_dfu();
+		if(n && packet[0] == 0x7f) request_system_dfu();
 		if(n) {
 			ack_cmd = packet[0];
 			ack_status = vendor_command(packet, n);
@@ -841,6 +844,11 @@ void tud_resume_cb(void) { usb_online = true; }
 
 int main(void) {
 	safe_early_init();
+	if(dfu_request == DFU_REQUEST_MAGIC) {
+		dfu_request = 0;
+		__DSB();
+		jump_system_dfu();
+	}
 	clock_init();
 	gpio_init();
 	outputs_off();

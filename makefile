@@ -37,8 +37,21 @@ ifeq ($(TARGET),rp2350)
 	sync
 else
 	@command -v dfu-util >/dev/null || { echo "dfu-util is required" >&2; exit 1; }
-	dfu-util -d 0483:df11 -a 0 -s $(STM32_DFU_ADDRESS):leave \
-		-D $(BUILD_DIR)/platforms/stm32g4/STM32G431_TinyKnob.bin
+	@lsusb -d 0483:df11 >/dev/null 2>&1 || \
+		{ echo "STM32 ROM DFU device 0483:df11 not found" >&2; exit 1; }
+	@set +e; \
+	dfu-util -d 0483:df11 -a 0 -R -s $(STM32_DFU_ADDRESS):leave \
+		-D $(BUILD_DIR)/platforms/stm32g4/STM32G431_TinyKnob.bin; \
+	rc=$$?; set -e; \
+	if [ $$rc -eq 0 ]; then exit 0; fi; \
+	for i in $$(seq 1 30); do \
+		if lsusb -d acdc:4011 >/dev/null 2>&1; then \
+			echo "STM32G4 application started (ROM DFU disconnected before final status)"; \
+			exit 0; \
+		fi; \
+		sleep 0.1; \
+	done; \
+	exit $$rc
 endif
 
 # Host clean; if an RP2350 build is root-owned from Docker, use docker_clean.

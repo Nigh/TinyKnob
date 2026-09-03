@@ -94,6 +94,9 @@ typedef enum {
 	STATE_FAULT,
 } test_state_t;
 
+#define DFU_REQUEST_MAGIC 0x44465531u
+__attribute__((section(".noinit.dfu"))) static volatile uint32_t dfu_request;
+
 static volatile uint32_t milliseconds;
 static volatile test_state_t state;
 static volatile uint32_t state_ticks;
@@ -405,6 +408,42 @@ static void safe_early_init(void) {
 	LL_GPIO_SetPinMode(GPIOC, LL_GPIO_PIN_4, LL_GPIO_MODE_OUTPUT);
 }
 
+static void reset_bootloader_state(void) {
+	__disable_irq();
+	SCB->VTOR = FLASH_BASE;
+	SysTick->CTRL = 0;
+	SysTick->LOAD = 0;
+	SysTick->VAL = 0;
+	SCB->ICSR = SCB_ICSR_PENDSTCLR_Msk | SCB_ICSR_PENDSVCLR_Msk;
+	for(uint32_t i = 0; i < 8u; i++) {
+		NVIC->ICER[i] = 0xffffffffu;
+		NVIC->ICPR[i] = 0xffffffffu;
+	}
+	__DSB();
+	__ISB();
+
+	LL_RCC_HSI_Enable();
+	while(!LL_RCC_HSI_IsReady()) {}
+	LL_RCC_SetAHBPrescaler(LL_RCC_SYSCLK_DIV_1);
+	LL_RCC_SetAPB1Prescaler(LL_RCC_APB1_DIV_1);
+	LL_RCC_SetAPB2Prescaler(LL_RCC_APB2_DIV_1);
+	LL_RCC_SetSysClkSource(LL_RCC_SYS_CLKSOURCE_HSI);
+	while(LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_HSI) {}
+	LL_RCC_PLL_Disable();
+	while(LL_RCC_PLL_IsReady()) {}
+	LL_RCC_HSE_Disable();
+	while(LL_RCC_HSE_IsReady()) {}
+
+	LL_AHB1_GRP1_ForceReset(LL_AHB1_GRP1_PERIPH_DMA1 | LL_AHB1_GRP1_PERIPH_DMAMUX1);
+	LL_AHB1_GRP1_ReleaseReset(LL_AHB1_GRP1_PERIPH_DMA1 | LL_AHB1_GRP1_PERIPH_DMAMUX1);
+	LL_AHB2_GRP1_ForceReset(LL_AHB2_GRP1_PERIPH_ADC12);
+	LL_AHB2_GRP1_ReleaseReset(LL_AHB2_GRP1_PERIPH_ADC12);
+	LL_APB1_GRP1_ForceReset(LL_APB1_GRP1_PERIPH_USB);
+	LL_APB1_GRP1_ReleaseReset(LL_APB1_GRP1_PERIPH_USB);
+	LL_APB2_GRP1_ForceReset(LL_APB2_GRP1_PERIPH_TIM1);
+	LL_APB2_GRP1_ReleaseReset(LL_APB2_GRP1_PERIPH_TIM1);
+}
+
 static void clock_init(void) {
 	LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_PWR);
 	LL_PWR_EnableRange1BoostMode();
@@ -701,26 +740,40 @@ static bool vendor_diag(void) {
 	return true;
 }
 
-__attribute__((noreturn)) static void enter_system_dfu(void) {
+__attribute__((noreturn)) static void jump_system_dfu(void) {
 	typedef void (*entry_fn_t)(void);
 	const uint32_t system_memory = 0x1fff0000u;
-	outputs_off();
-	tud_disconnect();
-	delay_cycles(SystemCoreClock / 100u);
+	uint32_t stack = *(uint32_t *)system_memory;
+	entry_fn_t entry = (entry_fn_t)*(uint32_t *)(system_memory + 4u);
 	__disable_irq();
 	SysTick->CTRL = 0;
-	for(uint32_t i = 0; i < 8; i++) {
+	SysTick->LOAD = 0;
+	SysTick->VAL = 0;
+	SCB->ICSR = SCB_ICSR_PENDSTCLR_Msk | SCB_ICSR_PENDSVCLR_Msk;
+	for(uint32_t i = 0; i < 8u; i++) {
 		NVIC->ICER[i] = 0xffffffffu;
 		NVIC->ICPR[i] = 0xffffffffu;
 	}
-	LL_RCC_HSI_Enable();
-	while(!LL_RCC_HSI_IsReady()) {}
-	LL_RCC_SetSysClkSource(LL_RCC_SYS_CLKSOURCE_HSI);
-	while(LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_HSI) {}
-	LL_RCC_PLL_Disable();
-	SCB->VTOR = system_memory;
-	__set_MSP(*(uint32_t *)system_memory);
-	((entry_fn_t)*(uint32_t *)(system_memory + 4u))();
+	LL_APB2_GRP1_EnableClock(LL_APB2_GRP1_PERIPH_SYSCFG);
+	LL_SYSCFG_SetRemapMemory(LL_SYSCFG_REMAP_SYSTEMFLASH);
+	SCB->VTOR = 0;
+	__set_CONTROL(0);
+	__set_MSP(stack);
+	__DSB();
+	__ISB();
+	__enable_irq();
+	entry();
+	for(;;) {}
+}
+
+__attribute__((noreturn)) static void request_system_dfu(void) {
+	outputs_off();
+	tud_disconnect();
+	/* Let the host and hub observe detach before the ROM reconnects. */
+	delay_cycles(SystemCoreClock / 4u);
+	dfu_request = DFU_REQUEST_MAGIC;
+	__DSB();
+	NVIC_SystemReset();
 	for(;;) {}
 }
 
@@ -820,7 +873,8 @@ static void vendor_task(void) {
 	if(tud_vendor_available()) {
 		uint8_t packet[64];
 		uint32_t n = tud_vendor_read(packet, sizeof(packet));
-		if(n && packet[0] == 0x7f) enter_system_dfu();
+		if(n) tud_vendor_write_clear();
+		if(n && packet[0] == 0x7f) request_system_dfu();
 		if(n) {
 			ack_cmd = packet[0];
 			ack_status = vendor_command(packet, n);
@@ -841,6 +895,12 @@ void tud_suspend_cb(bool remote_wakeup_en) { (void)remote_wakeup_en; usb_online 
 void tud_resume_cb(void) { usb_online = true; }
 
 int main(void) {
+	if(dfu_request == DFU_REQUEST_MAGIC) {
+		dfu_request = 0;
+		__DSB();
+		jump_system_dfu();
+	}
+	reset_bootloader_state();
 	safe_early_init();
 	clock_init();
 	gpio_init();
@@ -849,6 +909,7 @@ int main(void) {
 	timer_init();
 	adc_dma_init();
 	usb_init();
+	__enable_irq();
 	if(crc6(0) != 0 || crc6(1) != 0x03 || crc6(0x3ffffu) != 0x0e)
 		enter_fault("crc_selfcheck");
 	uint32_t sample_ms = 0;
@@ -868,7 +929,8 @@ int main(void) {
 			if(state == STATE_VERIFY && good && ++verify_good >= 8u) {
 				state = STATE_CALIBRATE; state_ticks = 0; outputs_on();
 			}
-			if((state == STATE_TEST_FWD || state == STATE_TEST_REV) && now - motion_ms0 >= ENCODER_STALL_MS) {
+			if((state == STATE_TEST_FWD || state == STATE_TEST_REV) && state_ticks < TEST_MOVE_TICKS &&
+				now - motion_ms0 >= ENCODER_STALL_MS) {
 				int32_t moved = enc_pos - motion_pos0; if(moved < 0) moved = -moved;
 				if(moved < ENCODER_STALL_COUNTS) enter_fault("encoder_stall");
 				else { motion_pos0 = enc_pos; motion_ms0 = now; }

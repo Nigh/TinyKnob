@@ -118,6 +118,7 @@ static bool diag_pending;
 static int16_t duty_a_q15, duty_b_q15, duty_c_q15;
 static volatile uint16_t adc_dma[4];
 static volatile bool adc_sample_ready;
+static volatile uint32_t adc_sequence;
 static float adc_offset[3];
 static uint32_t adc_offset_sum[3], adc_offset_n;
 static float ia, ib, ic, id_meas, iq_meas, vbus;
@@ -291,6 +292,7 @@ void DMA1_Channel1_IRQHandler(void) {
 	if(LL_DMA_IsActiveFlag_TC1(DMA1)) {
 		LL_DMA_ClearFlag_TC1(DMA1);
 		adc_sample_ready = true;
+		adc_sequence++;
 		process_adc_sample();
 	}
 	if(LL_DMA_IsActiveFlag_TE1(DMA1)) LL_DMA_ClearFlag_TE1(DMA1);
@@ -679,6 +681,7 @@ static uint8_t fault_code(void) {
 	if(strcmp(fault_reason, "encoder_stall") == 0) return 3;
 	if(strcmp(fault_reason, "overcurrent") == 0) return 4;
 	if(strcmp(fault_reason, "align_motion") == 0) return 5;
+	if(strcmp(fault_reason, "adc_stale") == 0) return 6;
 	return 0;
 }
 
@@ -849,12 +852,17 @@ int main(void) {
 		enter_fault("crc_selfcheck");
 	uint32_t sample_ms = 0;
 	uint32_t led_ms = 0;
+	uint32_t adc_seen = adc_sequence;
+	uint8_t adc_stale_ms = 0;
 	for(;;) {
 		tud_task();
 		vendor_task();
 		uint32_t now = milliseconds;
 		if(now != sample_ms) {
 			sample_ms = now;
+			uint32_t sequence = adc_sequence;
+			if(sequence != adc_seen) { adc_seen = sequence; adc_stale_ms = 0; }
+			else if(LL_GPIO_IsOutputPinSet(GPIOC, LL_GPIO_PIN_4) && ++adc_stale_ms >= 2u) enter_fault("adc_stale");
 			bool good = encoder_read();
 			if(state == STATE_VERIFY && good && ++verify_good >= 8u) {
 				state = STATE_CALIBRATE; state_ticks = 0; outputs_on();

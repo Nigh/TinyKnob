@@ -41,19 +41,19 @@ All multi-byte fields are **little-endian**.
 
 On Linux with libusb, prefer matching by VID/PID then selecting the interface with `bInterfaceClass == 0xFF`.
 
-### STM32G4 minimal-build compatibility
+### STM32G4 compatibility
 
-The `TinyRoller STM32G4` product exposes only the Vendor interface (index 0); it
-does not expose CDC. Endpoints, ACKs, and 25-byte telemetry use the same layouts
-as above. This bring-up build supports only `START` (`0x01`), `STOP` (`0x02`),
-and `TEST` (`0x05`); unsupported commands are rejected with ACK `status=0`.
-Telemetry reports modes IDLE=0, ALIGN=2, TEST=5, and FAULT=8. Id, Iq, Iq_ref,
-and Vbus are zero until synchronized ADC/DMA sensing is implemented. Use
-`tools/stm32g4_motor_test.py` for its guarded align/test/stop sequence.
+The `TinyRoller STM32G4` product exposes only the Vendor interface (index 0); CDC
+is disabled. It implements the common START, STOP, SPRING, SPIN, TEST, GOTO/POS,
+STRESS, GEAR, SET_K, SET_REST, SET_COG_SCALE, and UPLOAD commands. ACK, mode, and
+25-byte telemetry layouts are identical; current and Vbus fields contain live
+ADC/DMA measurements. `UPLOAD` jumps to STM32 ROM USB DFU (`0483:DF11`).
+
 For bring-up diagnostics, command `0x30` returns its normal ACK followed by a
-19-byte `0x5C` packet: version, mode, fault code (`1` self-check, `2` encoder
-CRC, `3` encoder stall), raw SSI frame (3 bytes, MSB first), then little-endian
-`u32` counters for CRC OK, CRC failed, and consecutive CRC failed.
+19-byte `0x5C` packet: version, mode, fault code (`1` self-check, `2` encoder CRC,
+`3` encoder stall, `4` overcurrent, `5` insufficient alignment motion), raw SSI
+frame (3 bytes, MSB first), then little-endian `u32` counters for CRC OK, CRC
+failed, and consecutive CRC failed.
 
 ## Telemetry stream (device → host, Bulk IN)
 

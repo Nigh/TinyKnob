@@ -407,6 +407,42 @@ static void safe_early_init(void) {
 	LL_GPIO_SetPinMode(GPIOC, LL_GPIO_PIN_4, LL_GPIO_MODE_OUTPUT);
 }
 
+static void reset_bootloader_state(void) {
+	__disable_irq();
+	SCB->VTOR = FLASH_BASE;
+	SysTick->CTRL = 0;
+	SysTick->LOAD = 0;
+	SysTick->VAL = 0;
+	SCB->ICSR = SCB_ICSR_PENDSTCLR_Msk | SCB_ICSR_PENDSVCLR_Msk;
+	for(uint32_t i = 0; i < 8u; i++) {
+		NVIC->ICER[i] = 0xffffffffu;
+		NVIC->ICPR[i] = 0xffffffffu;
+	}
+	__DSB();
+	__ISB();
+
+	LL_RCC_HSI_Enable();
+	while(!LL_RCC_HSI_IsReady()) {}
+	LL_RCC_SetAHBPrescaler(LL_RCC_SYSCLK_DIV_1);
+	LL_RCC_SetAPB1Prescaler(LL_RCC_APB1_DIV_1);
+	LL_RCC_SetAPB2Prescaler(LL_RCC_APB2_DIV_1);
+	LL_RCC_SetSysClkSource(LL_RCC_SYS_CLKSOURCE_HSI);
+	while(LL_RCC_GetSysClkSource() != LL_RCC_SYS_CLKSOURCE_STATUS_HSI) {}
+	LL_RCC_PLL_Disable();
+	while(LL_RCC_PLL_IsReady()) {}
+	LL_RCC_HSE_Disable();
+	while(LL_RCC_HSE_IsReady()) {}
+
+	LL_AHB1_GRP1_ForceReset(LL_AHB1_GRP1_PERIPH_DMA1 | LL_AHB1_GRP1_PERIPH_DMAMUX1);
+	LL_AHB1_GRP1_ReleaseReset(LL_AHB1_GRP1_PERIPH_DMA1 | LL_AHB1_GRP1_PERIPH_DMAMUX1);
+	LL_AHB2_GRP1_ForceReset(LL_AHB2_GRP1_PERIPH_ADC12);
+	LL_AHB2_GRP1_ReleaseReset(LL_AHB2_GRP1_PERIPH_ADC12);
+	LL_APB1_GRP1_ForceReset(LL_APB1_GRP1_PERIPH_USB);
+	LL_APB1_GRP1_ReleaseReset(LL_APB1_GRP1_PERIPH_USB);
+	LL_APB2_GRP1_ForceReset(LL_APB2_GRP1_PERIPH_TIM1);
+	LL_APB2_GRP1_ReleaseReset(LL_APB2_GRP1_PERIPH_TIM1);
+}
+
 static void clock_init(void) {
 	LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_PWR);
 	LL_PWR_EnableRange1BoostMode();
@@ -843,12 +879,13 @@ void tud_suspend_cb(bool remote_wakeup_en) { (void)remote_wakeup_en; usb_online 
 void tud_resume_cb(void) { usb_online = true; }
 
 int main(void) {
-	safe_early_init();
 	if(dfu_request == DFU_REQUEST_MAGIC) {
 		dfu_request = 0;
 		__DSB();
 		jump_system_dfu();
 	}
+	reset_bootloader_state();
+	safe_early_init();
 	clock_init();
 	gpio_init();
 	outputs_off();
@@ -856,6 +893,7 @@ int main(void) {
 	timer_init();
 	adc_dma_init();
 	usb_init();
+	__enable_irq();
 	if(crc6(0) != 0 || crc6(1) != 0x03 || crc6(0x3ffffu) != 0x0e)
 		enter_fault("crc_selfcheck");
 	uint32_t sample_ms = 0;

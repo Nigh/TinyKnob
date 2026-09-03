@@ -322,7 +322,8 @@ void TIM1_UP_TIM16_IRQHandler(void) {
 			if(moved < 0) { moved = -moved; motor_dir = -1; }
 			else motor_dir = 1;
 			if(moved < DIR_PULSE_COUNTS) { enter_fault("align_motion"); break; }
-			int64_t phase = (int64_t)motor_dir * align_pos * MOTOR_POLE_PAIRS * 262144ll;
+			/* The q-axis direction pulse moves the rotor; zero Park angle at its final position. */
+			int64_t phase = (int64_t)motor_dir * enc_pos * MOTOR_POLE_PAIRS * 262144ll;
 			electrical_offset_phase = (uint32_t)-phase;
 			outputs_off(); aligned = true; state_ticks = 0; state = STATE_READY;
 		}

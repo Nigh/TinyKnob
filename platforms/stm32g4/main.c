@@ -362,8 +362,8 @@ void TIM1_UP_TIM16_IRQHandler(void) {
 			if(moved < DIR_PULSE_COUNTS) { enter_fault("align_motion"); break; }
 			/* The pulse seeks the nearest magnetic pole, so its sign is not motor direction. */
 			motor_dir = -1;
-			/* The q-axis direction pulse moves the rotor; zero Park angle at its final position. */
-			int64_t phase = (int64_t)motor_dir * enc_pos * MOTOR_POLE_PAIRS * 262144ll;
+			/* Match RP2350: retain the averaged d-axis alignment reference through the q pulse. */
+			int64_t phase = (int64_t)motor_dir * align_pos * MOTOR_POLE_PAIRS * 262144ll;
 			electrical_offset_phase = (uint32_t)-phase;
 			state_ticks = 0; state = STATE_ALIGN_DOWN;
 		}

@@ -31,12 +31,16 @@
 #define CS_GAIN_V_PER_A 0.3f
 #define CS_SIGN (-1.f)
 #define I_TRIP_A 4.f
+#define DIR_PULSE_TICKS (PWM_HZ * 600u / 1000u)
+#define DIR_PULSE_UQ 0.18f
+#define DIR_PULSE_COUNTS 80
 
 typedef enum {
 	STATE_DISABLED,
 	STATE_VERIFY,
 	STATE_CALIBRATE,
 	STATE_ALIGN,
+	STATE_DIR_PULSE,
 	STATE_READY,
 	STATE_TEST_ALIGN,
 	STATE_TEST_FWD,
@@ -76,6 +80,7 @@ static uint32_t adc_offset_sum[3], adc_offset_n;
 static float ia, ib, ic, id_meas, iq_meas, vbus;
 static float electrical_offset;
 static int8_t motor_dir = 1;
+static int32_t align_pos, pulse_pos;
 
 static void delay_cycles(uint32_t cycles);
 
@@ -144,15 +149,22 @@ void TIM1_UP_TIM16_IRQHandler(void) {
 	case STATE_TEST_ALIGN:
 		apply_voltage(0.08f, 0.f, 0);
 		if(state_ticks >= PWM_HZ / 2u) {
-			outputs_off();
+			align_pos = enc_pos;
+			pulse_pos = enc_pos;
 			state_ticks = 0;
-			state = state == STATE_ALIGN ? STATE_READY : STATE_TEST_FWD;
-			if(state == STATE_TEST_FWD) {
-				phase_q32 = 0;
-				motion_pos0 = enc_pos;
-				motion_ms0 = milliseconds;
-				outputs_on();
-			}
+			state = STATE_DIR_PULSE;
+		}
+		break;
+	case STATE_DIR_PULSE:
+		apply_voltage(0.f, DIR_PULSE_UQ, 0);
+		if(state_ticks >= DIR_PULSE_TICKS) {
+			int32_t moved = enc_pos - pulse_pos;
+			if(moved < 0) { moved = -moved; motor_dir = -1; }
+			else motor_dir = 1;
+			if(moved < DIR_PULSE_COUNTS) { enter_fault("align_motion"); break; }
+			float theta_m = (float)align_pos * (TWO_PI / 16384.f);
+			electrical_offset = -(float)motor_dir * theta_m * (float)MOTOR_POLE_PAIRS;
+			outputs_off(); state_ticks = 0; state = STATE_READY;
 		}
 		break;
 	case STATE_TEST_FWD:
@@ -402,6 +414,7 @@ static uint8_t protocol_mode(void) {
 	if(state == STATE_TEST_FWD || state == STATE_TEST_PAUSE_FWD ||
 			state == STATE_TEST_REV || state == STATE_TEST_PAUSE_REV)
 		return 5;
+	if(state == STATE_DIR_PULSE) return 3;
 	if(state == STATE_VERIFY || state == STATE_CALIBRATE || state == STATE_ALIGN || state == STATE_TEST_ALIGN)
 		return 2;
 	return 0;
@@ -420,6 +433,7 @@ static uint8_t fault_code(void) {
 	if(strcmp(fault_reason, "encoder_crc") == 0) return 2;
 	if(strcmp(fault_reason, "encoder_stall") == 0) return 3;
 	if(strcmp(fault_reason, "overcurrent") == 0) return 4;
+	if(strcmp(fault_reason, "align_motion") == 0) return 5;
 	return 0;
 }
 
@@ -473,7 +487,8 @@ static uint8_t vendor_command(uint8_t cmd) {
 	}
 	if(cmd == 0x05) {
 		if(state != STATE_READY) return 0;
-		state = STATE_TEST_ALIGN; state_ticks = 0; outputs_on();
+		state = STATE_TEST_FWD; state_ticks = 0; phase_q32 = 0;
+		motion_pos0 = enc_pos; motion_ms0 = milliseconds; outputs_on();
 		return 1;
 	}
 	if(cmd == 0x30) return 1;

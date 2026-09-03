@@ -27,10 +27,15 @@
 #define SIN_N 256u
 #define TWO_PI 6.28318530718f
 #define ADC_SAMPLE_POINT ((PWM_TOP * 94u) / 100u)
+#define ADC_TO_V (3.3f / 4095.f)
+#define CS_GAIN_V_PER_A 0.3f
+#define CS_SIGN (-1.f)
+#define I_TRIP_A 4.f
 
 typedef enum {
 	STATE_DISABLED,
 	STATE_VERIFY,
+	STATE_CALIBRATE,
 	STATE_ALIGN,
 	STATE_READY,
 	STATE_TEST_ALIGN,
@@ -66,6 +71,11 @@ static bool diag_pending;
 static int16_t duty_a_q15, duty_b_q15, duty_c_q15;
 static volatile uint16_t adc_dma[4];
 static volatile bool adc_sample_ready;
+static float adc_offset[3];
+static uint32_t adc_offset_sum[3], adc_offset_n;
+static float ia, ib, ic, id_meas, iq_meas, vbus;
+static float electrical_offset;
+static int8_t motor_dir = 1;
 
 static void delay_cycles(uint32_t cycles);
 
@@ -347,12 +357,52 @@ static bool encoder_read(void) {
 	return true;
 }
 
+static int16_t to_i16(float value) {
+	if(value > 32767.f) return 32767;
+	if(value < -32768.f) return -32768;
+	return (int16_t)value;
+}
+
+static void process_adc_sample(void) {
+	if(!adc_sample_ready) return;
+	adc_sample_ready = false;
+	uint16_t raw[4] = {adc_dma[0], adc_dma[1], adc_dma[2], adc_dma[3]};
+	if(state == STATE_CALIBRATE) {
+		for(uint32_t i = 0; i < 3; i++) adc_offset_sum[i] += raw[i];
+		if(++adc_offset_n >= 256u) {
+			for(uint32_t i = 0; i < 3; i++) adc_offset[i] = (float)adc_offset_sum[i] / 256.f;
+			state = STATE_ALIGN; state_ticks = 0;
+		}
+		return;
+	}
+	if(adc_offset_n < 256u) return;
+	float sa = CS_SIGN * ((float)raw[0] - adc_offset[0]) * ADC_TO_V / CS_GAIN_V_PER_A;
+	float sb = CS_SIGN * ((float)raw[1] - adc_offset[1]) * ADC_TO_V / CS_GAIN_V_PER_A;
+	float sc = CS_SIGN * ((float)raw[2] - adc_offset[2]) * ADC_TO_V / CS_GAIN_V_PER_A;
+	/* Match the RP2350 validated CS_PHASE_ORD=4 (CAB). */
+	ia = sc; ib = sa; ic = sb;
+	vbus = (float)raw[3] * ADC_TO_V * 10.f;
+	float theta_m = (float)enc_pos * (TWO_PI / 16384.f);
+	float te = (float)motor_dir * theta_m * (float)MOTOR_POLE_PAIRS + electrical_offset - 0.70f;
+	uint8_t index = (uint8_t)(te * (256.f / TWO_PI));
+	float sn = sin_lut[index], cs = sin_lut[(uint8_t)(index + 64u)];
+	float alpha = ia;
+	float beta = (ia + 2.f * ib) * 0.57735026919f;
+	float id = alpha * cs + beta * sn;
+	float iq = -alpha * sn + beta * cs;
+	const float lp = 0.04712389f; /* 150 Hz at 20 kHz sampling. */
+	id_meas += lp * (id - id_meas);
+	iq_meas += lp * (iq - iq_meas);
+	if(fabsf(ia) > I_TRIP_A || fabsf(ib) > I_TRIP_A || fabsf(ic) > I_TRIP_A)
+		enter_fault("overcurrent");
+}
+
 static uint8_t protocol_mode(void) {
 	if(state == STATE_FAULT) return 8;
 	if(state == STATE_TEST_FWD || state == STATE_TEST_PAUSE_FWD ||
 			state == STATE_TEST_REV || state == STATE_TEST_PAUSE_REV)
 		return 5;
-	if(state == STATE_VERIFY || state == STATE_ALIGN || state == STATE_TEST_ALIGN)
+	if(state == STATE_VERIFY || state == STATE_CALIBRATE || state == STATE_ALIGN || state == STATE_TEST_ALIGN)
 		return 2;
 	return 0;
 }
@@ -369,6 +419,7 @@ static uint8_t fault_code(void) {
 	if(strcmp(fault_reason, "crc_selfcheck") == 0) return 1;
 	if(strcmp(fault_reason, "encoder_crc") == 0) return 2;
 	if(strcmp(fault_reason, "encoder_stall") == 0) return 3;
+	if(strcmp(fault_reason, "overcurrent") == 0) return 4;
 	return 0;
 }
 
@@ -416,7 +467,8 @@ static uint8_t vendor_command(uint8_t cmd) {
 		return 1;
 	}
 	if(cmd == 0x01) {
-		outputs_off(); verify_good = 0; fault_reason[0] = 0; state = STATE_VERIFY;
+		outputs_off(); verify_good = 0; fault_reason[0] = 0;
+		adc_offset_n = 0; memset(adc_offset_sum, 0, sizeof(adc_offset_sum)); state = STATE_VERIFY;
 		return 1;
 	}
 	if(cmd == 0x05) {
@@ -442,6 +494,11 @@ static void vendor_telem(void) {
 	p[8] = (uint8_t)duty_b_q15; p[9] = (uint8_t)(duty_b_q15 >> 8);
 	p[10] = (uint8_t)duty_c_q15; p[11] = (uint8_t)(duty_c_q15 >> 8);
 	p[12] = (uint8_t)seq; p[13] = (uint8_t)(seq >> 8);
+	int16_t id_ma = to_i16(id_meas * 1000.f), iq_ma = to_i16(iq_meas * 1000.f);
+	uint16_t vbus_mv = vbus <= 0.f ? 0u : vbus >= 65.535f ? 65535u : (uint16_t)(vbus * 1000.f);
+	p[14] = (uint8_t)id_ma; p[15] = (uint8_t)(id_ma >> 8);
+	p[16] = (uint8_t)iq_ma; p[17] = (uint8_t)(iq_ma >> 8);
+	p[20] = (uint8_t)vbus_mv; p[21] = (uint8_t)(vbus_mv >> 8);
 	p[22] = (uint8_t)uq_q15; p[23] = (uint8_t)(uq_q15 >> 8); p[24] = (uint8_t)dir;
 	seq++;
 	tud_vendor_write(p, sizeof(p));
@@ -498,11 +555,14 @@ int main(void) {
 	for(;;) {
 		tud_task();
 		vendor_task();
+		process_adc_sample();
 		uint32_t now = milliseconds;
 		if(now != sample_ms) {
 			sample_ms = now;
 			bool good = encoder_read();
-			if(state == STATE_VERIFY && good && ++verify_good >= 8u) { state = STATE_ALIGN; state_ticks = 0; outputs_on();  }
+			if(state == STATE_VERIFY && good && ++verify_good >= 8u) {
+				state = STATE_CALIBRATE; state_ticks = 0; outputs_on();
+			}
 			if((state == STATE_TEST_FWD || state == STATE_TEST_REV) && now - motion_ms0 >= ENCODER_STALL_MS) {
 				int32_t moved = enc_pos - motion_pos0; if(moved < 0) moved = -moved;
 				if(moved < ENCODER_STALL_COUNTS) enter_fault("encoder_stall");

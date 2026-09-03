@@ -14,6 +14,7 @@
 #include "stm32g4xx_ll_rcc.h"
 #include "stm32g4xx_ll_tim.h"
 #include "tusb.h"
+#include "cog_lut_default.h"
 
 #define PWM_HZ 20000u
 #define PWM_TOP 3600u
@@ -70,6 +71,7 @@
 #define GEAR_CLICK_TICKS 1u
 #define GEAR_D 0.0008f
 #define GEAR_D_UQ_MAX 0.03f
+#define SPIN_IQ_CAP 0.20f
 
 typedef enum {
 	STATE_DISABLED,
@@ -121,7 +123,7 @@ static int32_t align_pos, pulse_pos;
 static int32_t home_pos, move_start, move_target;
 static bool test_forward;
 static volatile float iq_ref;
-static float id_integral, iq_integral, ud_out, uq_out;
+static float id_integral, iq_integral, ud_out, uq_out, uq_feedforward;
 static bool current_control;
 static uint8_t current_div;
 static bool aligned;
@@ -130,7 +132,7 @@ static float track_velocity, velocity;
 static uint16_t velocity_prev;
 static bool velocity_have;
 static uint8_t stress_phase;
-static float gear_center, gear_prev_progress;
+static float gear_center, gear_prev_progress, gear_cog_center;
 static uint32_t gear_click_ticks;
 
 static void delay_cycles(uint32_t cycles);
@@ -176,6 +178,8 @@ static void outputs_on(void) {
 
 static void enter_fault(char const *reason) {
 	outputs_off();
+	aligned = false;
+	current_control = false;
 	state = STATE_FAULT;
 	strncpy(fault_reason, reason, sizeof(fault_reason) - 1u);
 	fault_reason[sizeof(fault_reason) - 1u] = 0;
@@ -196,7 +200,7 @@ static uint32_t phase_from_rad(float radians) {
 }
 
 static void current_reset(void) {
-	iq_ref = 0.f; id_integral = 0.f; iq_integral = 0.f; ud_out = 0.f; uq_out = 0.f;
+	iq_ref = 0.f; id_integral = 0.f; iq_integral = 0.f; ud_out = 0.f; uq_out = 0.f; uq_feedforward = 0.f;
 }
 
 static uint32_t encoder_electrical_phase(void) {
@@ -204,9 +208,22 @@ static uint32_t encoder_electrical_phase(void) {
 	return electrical_offset_phase + (uint32_t)delta;
 }
 
+static float cog_command(int32_t position) {
+	int32_t wrapped = position % 16384;
+	if(wrapped < 0) wrapped += 16384;
+	uint32_t i0 = (uint32_t)wrapped / 16u, i1 = (i0 + 1u) & 1023u;
+	float fraction = (float)(wrapped & 15) * (1.f / 16.f);
+	float value = COG_LUT_FLASH[i0] + (COG_LUT_FLASH[i1] - COG_LUT_FLASH[i0]) * fraction;
+	float scale = state == STATE_GEAR ? 1.f : state == STATE_SPRING ? 0.1f : 0.65f;
+	return scale * value;
+}
+
 static void apply_encoder_voltage(float uq) {
 	current_control = false;
-	iq_ref = 0.f; uq_out = (float)motor_dir * uq;
+	iq_ref = 0.f;
+	float cog = cog_command(enc_pos);
+	if(state == STATE_GEAR) cog -= gear_cog_center;
+	uq_out = (float)motor_dir * (uq + cog);
 	apply_voltage(0.f, uq_out, encoder_electrical_phase());
 }
 
@@ -329,9 +346,17 @@ void TIM1_UP_TIM16_IRQHandler(void) {
 		apply_encoder_voltage(state_ticks < SPRING_SETTLE_TICKS ? 0.f : spring_command(rest_pos - enc_pos));
 		if(state_ticks < SPRING_SETTLE_TICKS) rest_pos = enc_pos;
 		break;
-	case STATE_SPIN:
-		apply_encoder_voltage(spin_command());
+	case STATE_SPIN: {
+		float av = fabsf(velocity);
+		if(av > SPIN_W_MAX) {
+			float sign = velocity < 0.f ? -1.f : 1.f;
+			float brake = -sign * clampf((av - SPIN_W_MAX) / SPIN_W_MAX, 0.f, 1.f) * SPIN_IQ_CAP;
+			iq_ref = (float)motor_dir * brake;
+			uq_feedforward = (float)motor_dir * spin_command();
+			current_control = true;
+		} else apply_encoder_voltage(spin_command());
 		break;
+	}
 	case STATE_STRESS: {
 		uint32_t duration = (stress_phase == 1 || stress_phase == 5) ? STRESS_RUN_TICKS :
 			(stress_phase == 3 || stress_phase == 7) ? STRESS_STOP_TICKS : STRESS_RAMP_TICKS;
@@ -590,7 +615,7 @@ static void process_adc_sample(void) {
 		id_integral += CUR_KI * ed * dt;
 		iq_integral += CUR_KI * eq * dt;
 		float ud_raw = CUR_KP * ed + id_integral;
-		float uq_raw = CUR_KP * eq + iq_integral;
+		float uq_raw = CUR_KP * eq + iq_integral + uq_feedforward;
 		float mag2 = ud_raw * ud_raw + uq_raw * uq_raw;
 		ud_out = ud_raw; uq_out = uq_raw;
 		if(mag2 > CUR_U_MAX * CUR_U_MAX) {
@@ -705,7 +730,7 @@ static uint8_t vendor_command(uint8_t const *packet, uint32_t n) {
 		current_reset(); current_control = true; state = STATE_POS; state_ticks = 0; outputs_on(); return 1;
 	}
 	if(cmd == 0x07) { stress_phase = 0; state_ticks = 0; state = STATE_STRESS; outputs_on(); return 1; }
-	if(cmd == 0x0a) { gear_center = (float)enc_pos; gear_prev_progress = 0.f; gear_click_ticks = 0; state_ticks = 0; state = STATE_GEAR; outputs_on(); return 1; }
+	if(cmd == 0x0a) { gear_center = (float)enc_pos; gear_cog_center = cog_command(enc_pos); gear_prev_progress = 0.f; gear_click_ticks = 0; state_ticks = 0; state = STATE_GEAR; outputs_on(); return 1; }
 	return 0;
 }
 
@@ -714,7 +739,7 @@ static void vendor_telem(void) {
 	if(!tud_vendor_mounted() || tud_vendor_write_available() < 25) return;
 	int32_t angle_mrad = (int32_t)(((int64_t)enc_pos * 6283) / 16384);
 	int16_t uq_q15 = to_i16(uq_out * 32767.f);
-	int8_t dir = state == STATE_TEST_REV ? -1 : 1;
+	int8_t dir = motor_dir;
 	uint8_t p[25] = {0};
 	p[0] = 0xa5; p[1] = protocol_mode();
 	p[2] = (uint8_t)angle_mrad; p[3] = (uint8_t)(angle_mrad >> 8);

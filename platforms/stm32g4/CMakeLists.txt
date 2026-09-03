@@ -32,6 +32,7 @@ set_source_files_properties(${TINYUSB_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")
 
 target_include_directories(${PROJECT_NAME} PRIVATE
 	${CMAKE_CURRENT_LIST_DIR}
+	${CMAKE_SOURCE_DIR}/src
 	${TINYUSB}/src
 	${STM32CUBE_G4}/Drivers/CMSIS/Core/Include
 	${CMSIS_DEVICE}/Include

@@ -353,8 +353,9 @@ void TIM1_UP_TIM16_IRQHandler(void) {
 		break;
 	}
 	case STATE_SPRING:
-		apply_encoder_voltage(state_ticks < SPRING_SETTLE_TICKS ? 0.f : spring_command(rest_pos - enc_pos));
-		if(state_ticks < SPRING_SETTLE_TICKS) rest_pos = enc_pos;
+		if(state_ticks < SPRING_SETTLE_TICKS) {
+			current_control = false; iq_ref = 0.f; uq_out = 0.f; set_duty(0.5f, 0.5f, 0.5f); rest_pos = enc_pos;
+		} else apply_encoder_voltage(spring_command(rest_pos - enc_pos));
 		break;
 	case STATE_SPIN: {
 		float av = fabsf(velocity);
@@ -384,7 +385,7 @@ void TIM1_UP_TIM16_IRQHandler(void) {
 	}
 	case STATE_GEAR:
 		if(gear_capture) {
-			apply_encoder_voltage(0.f); gear_center = (float)enc_pos;
+			current_control = false; iq_ref = 0.f; uq_out = 0.f; set_duty(0.5f, 0.5f, 0.5f); gear_center = (float)enc_pos;
 			if(state_ticks >= GEAR_CAPTURE_MIN_TICKS && fabsf(velocity) <= GEAR_CAPTURE_W_MAX) gear_capture_stable++;
 			else gear_capture_stable = 0;
 			if(gear_capture_stable >= GEAR_CAPTURE_STABLE_TICKS || state_ticks >= GEAR_CAPTURE_TIMEOUT_TICKS) {

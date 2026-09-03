@@ -43,6 +43,33 @@
 #define CUR_KI 400.f
 #define CUR_KAW 1000.f
 #define CUR_U_MAX 0.60f
+#define POS_D 0.05f
+#define SPRING_K 0.6f
+#define SPRING_UQ_MAX 0.35f
+#define SPRING_WALL_UQ 0.85f
+#define SPRING_WALL_BLEND_RAD 0.45f
+#define SPRING_WALL_D 0.15f
+#define SPRING_D_UQ_MAX 0.12f
+#define SPRING_NEUTRAL_RAD 0.00262f
+#define SPRING_SETTLE_TICKS (PWM_HZ * 2u)
+#define SPIN_KV 0.018f
+#define SPIN_B 0.000075f
+#define SPIN_B_HIGH 0.0015f
+#define SPIN_W_REST 0.35f
+#define SPIN_W_MAX 22.f
+#define SPIN_B_CAP 0.30f
+#define SPIN_UQ_MAX 0.50f
+#define STRESS_UQ_MAX 0.65f
+#define STRESS_RAMP_TICKS (PWM_HZ / 2u)
+#define STRESS_RUN_TICKS (PWM_HZ * 3u)
+#define STRESS_STOP_TICKS PWM_HZ
+#define GEAR_TEETH 24u
+#define GEAR_UQ 0.30f
+#define GEAR_PEAK_FRAC 0.86f
+#define GEAR_CLICK_UQ 0.08f
+#define GEAR_CLICK_TICKS 1u
+#define GEAR_D 0.0008f
+#define GEAR_D_UQ_MAX 0.03f
 
 typedef enum {
 	STATE_DISABLED,
@@ -51,18 +78,19 @@ typedef enum {
 	STATE_ALIGN,
 	STATE_DIR_PULSE,
 	STATE_READY,
-	STATE_TEST_ALIGN,
 	STATE_TEST_FWD,
-	STATE_TEST_PAUSE_FWD,
 	STATE_TEST_REV,
-	STATE_TEST_PAUSE_REV,
+	STATE_SPRING,
+	STATE_SPIN,
+	STATE_POS,
+	STATE_STRESS,
+	STATE_GEAR,
 	STATE_FAULT,
 } test_state_t;
 
 static volatile uint32_t milliseconds;
 static volatile test_state_t state;
 static volatile uint32_t state_ticks;
-static volatile uint32_t phase_q32;
 static volatile bool usb_online;
 static float sin_lut[SIN_N];
 static uint32_t enc_raw24;
@@ -87,7 +115,7 @@ static volatile bool adc_sample_ready;
 static float adc_offset[3];
 static uint32_t adc_offset_sum[3], adc_offset_n;
 static float ia, ib, ic, id_meas, iq_meas, vbus;
-static float electrical_offset;
+static uint32_t electrical_offset_phase;
 static int8_t motor_dir = 1;
 static int32_t align_pos, pulse_pos;
 static int32_t home_pos, move_start, move_target;
@@ -96,8 +124,17 @@ static volatile float iq_ref;
 static float id_integral, iq_integral, ud_out, uq_out;
 static bool current_control;
 static uint8_t current_div;
+static bool aligned;
+static int32_t rest_pos, track_pos;
+static float track_velocity, velocity;
+static uint16_t velocity_prev;
+static bool velocity_have;
+static uint8_t stress_phase;
+static float gear_center, gear_prev_progress;
+static uint32_t gear_click_ticks;
 
 static void delay_cycles(uint32_t cycles);
+static void process_adc_sample(void);
 
 static void outputs_off(void) {
 	LL_TIM_DisableAllOutputs(TIM1);
@@ -162,6 +199,66 @@ static void current_reset(void) {
 	iq_ref = 0.f; id_integral = 0.f; iq_integral = 0.f; ud_out = 0.f; uq_out = 0.f;
 }
 
+static uint32_t encoder_electrical_phase(void) {
+	int64_t delta = (int64_t)motor_dir * enc_pos * MOTOR_POLE_PAIRS * 262144ll;
+	return electrical_offset_phase + (uint32_t)delta;
+}
+
+static void apply_encoder_voltage(float uq) {
+	current_control = false;
+	iq_ref = 0.f; uq_out = (float)motor_dir * uq;
+	apply_voltage(0.f, uq_out, encoder_electrical_phase());
+}
+
+static float spring_command(int32_t error_counts) {
+	const float pi = 3.14159265f;
+	float error = (float)error_counts * (TWO_PI / 16384.f), ae = fabsf(error);
+	float spring_error = 0.f, neutral = 0.f;
+	if(ae > SPRING_NEUTRAL_RAD) {
+		spring_error = copysignf(ae - SPRING_NEUTRAL_RAD, error);
+		neutral = clampf((ae - SPRING_NEUTRAL_RAD) / SPRING_NEUTRAL_RAD, 0.f, 1.f);
+	}
+	float envelope = SPRING_UQ_MAX, damping_gain = 0.f;
+	float lo = pi - SPRING_WALL_BLEND_RAD, hi = pi + SPRING_WALL_BLEND_RAD;
+	if(ae >= hi) { envelope = SPRING_WALL_UQ; damping_gain = SPRING_WALL_D; }
+	else if(ae > lo) {
+		float t = (ae - lo) / (hi - lo);
+		envelope += t * (SPRING_WALL_UQ - SPRING_UQ_MAX);
+		damping_gain = t * SPRING_WALL_D;
+	}
+	float damping = clampf(damping_gain * neutral * velocity, -SPRING_D_UQ_MAX, SPRING_D_UQ_MAX);
+	return clampf(SPRING_K * spring_error - damping, -envelope, envelope);
+}
+
+static float spin_command(void) {
+	float av = fabsf(velocity);
+	if(av < SPIN_W_REST) return 0.f;
+	float sign = velocity < 0.f ? -1.f : 1.f;
+	float ramp = clampf((av - SPIN_W_REST) / SPIN_W_REST, 0.f, 1.f);
+	float frac = clampf(av / SPIN_W_MAX, 0.f, 1.f);
+	float damping = SPIN_B + (SPIN_B_HIGH - SPIN_B) * frac * frac;
+	float uq = (SPIN_KV - damping) * velocity * ramp;
+	if(av > SPIN_W_MAX) uq -= sign * clampf((av - SPIN_W_MAX) / SPIN_W_MAX, 0.f, 1.f) * SPIN_B_CAP;
+	return clampf(uq, -SPIN_UQ_MAX, SPIN_UQ_MAX);
+}
+
+static float gear_command(void) {
+	float tooth = 16384.f / (float)GEAR_TEETH;
+	float x = ((float)enc_pos - gear_center) / tooth;
+	int32_t crossed = (int32_t)x;
+	if(crossed) { gear_center += (float)crossed * tooth; x = ((float)enc_pos - gear_center) / tooth; gear_prev_progress = 0.f; }
+	float progress = fabsf(x) - floorf(fabsf(x));
+	if(progress >= GEAR_PEAK_FRAC && gear_prev_progress < GEAR_PEAK_FRAC) gear_click_ticks = GEAR_CLICK_TICKS;
+	gear_prev_progress = progress;
+	float mag = 0.f;
+	if(progress < GEAR_PEAK_FRAC) { float rise = progress / GEAR_PEAK_FRAC; mag = GEAR_UQ * rise * rise * rise; }
+	float sign = x < 0.f ? -1.f : 1.f;
+	float click = gear_click_ticks ? sign * GEAR_CLICK_UQ : 0.f;
+	if(gear_click_ticks) gear_click_ticks--;
+	float damping = clampf(GEAR_D * velocity, -GEAR_D_UQ_MAX, GEAR_D_UQ_MAX);
+	return clampf(-sign * mag + click - damping, -GEAR_UQ - GEAR_CLICK_UQ - GEAR_D_UQ_MAX, GEAR_UQ + GEAR_CLICK_UQ + GEAR_D_UQ_MAX);
+}
+
 void SysTick_Handler(void) { milliseconds++; }
 void USB_HP_IRQHandler(void) { tud_int_handler(0); }
 void USB_LP_IRQHandler(void) { tud_int_handler(0); }
@@ -169,6 +266,7 @@ void DMA1_Channel1_IRQHandler(void) {
 	if(LL_DMA_IsActiveFlag_TC1(DMA1)) {
 		LL_DMA_ClearFlag_TC1(DMA1);
 		adc_sample_ready = true;
+		process_adc_sample();
 	}
 	if(LL_DMA_IsActiveFlag_TE1(DMA1)) LL_DMA_ClearFlag_TE1(DMA1);
 }
@@ -179,7 +277,6 @@ void TIM1_UP_TIM16_IRQHandler(void) {
 	state_ticks++;
 	switch(state) {
 	case STATE_ALIGN:
-	case STATE_TEST_ALIGN:
 		apply_voltage(0.08f, 0.f, 0);
 		if(state_ticks >= PWM_HZ / 2u) {
 			align_pos = enc_pos;
@@ -195,9 +292,9 @@ void TIM1_UP_TIM16_IRQHandler(void) {
 			if(moved < 0) { moved = -moved; motor_dir = -1; }
 			else motor_dir = 1;
 			if(moved < DIR_PULSE_COUNTS) { enter_fault("align_motion"); break; }
-			float theta_m = (float)align_pos * (TWO_PI / 16384.f);
-			electrical_offset = -(float)motor_dir * theta_m * (float)MOTOR_POLE_PAIRS;
-			outputs_off(); state_ticks = 0; state = STATE_READY;
+			int64_t phase = (int64_t)motor_dir * align_pos * MOTOR_POLE_PAIRS * 262144ll;
+			electrical_offset_phase = (uint32_t)-phase;
+			outputs_off(); aligned = true; state_ticks = 0; state = STATE_READY;
 		}
 		break;
 	case STATE_TEST_FWD:
@@ -222,6 +319,37 @@ void TIM1_UP_TIM16_IRQHandler(void) {
 		}
 		break;
 	}
+	case STATE_POS: {
+		float error = (float)(track_pos - enc_pos) * (TWO_PI / 16384.f);
+		float outer = clampf(POS_KP * error + POS_D * (track_velocity - velocity), -TEST_UQ_MAX, TEST_UQ_MAX);
+		iq_ref = (float)motor_dir * outer; current_control = true;
+		break;
+	}
+	case STATE_SPRING:
+		apply_encoder_voltage(state_ticks < SPRING_SETTLE_TICKS ? 0.f : spring_command(rest_pos - enc_pos));
+		if(state_ticks < SPRING_SETTLE_TICKS) rest_pos = enc_pos;
+		break;
+	case STATE_SPIN:
+		apply_encoder_voltage(spin_command());
+		break;
+	case STATE_STRESS: {
+		uint32_t duration = (stress_phase == 1 || stress_phase == 5) ? STRESS_RUN_TICKS :
+			(stress_phase == 3 || stress_phase == 7) ? STRESS_STOP_TICKS : STRESS_RAMP_TICKS;
+		float t = duration ? (float)state_ticks / (float)duration : 1.f;
+		float ss = smoothstep5(t), uq = 0.f;
+		if(stress_phase == 0) uq = STRESS_UQ_MAX * ss;
+		else if(stress_phase == 1) uq = STRESS_UQ_MAX;
+		else if(stress_phase == 2) uq = STRESS_UQ_MAX * (1.f - ss);
+		else if(stress_phase == 4) uq = -STRESS_UQ_MAX * ss;
+		else if(stress_phase == 5) uq = -STRESS_UQ_MAX;
+		else if(stress_phase == 6) uq = -STRESS_UQ_MAX * (1.f - ss);
+		apply_encoder_voltage(uq);
+		if(state_ticks >= duration) { stress_phase = (stress_phase + 1u) & 7u; state_ticks = 0; }
+		break;
+	}
+	case STATE_GEAR:
+		apply_encoder_voltage(gear_command());
+		break;
 	default:
 		break;
 	}
@@ -404,6 +532,15 @@ static bool encoder_read(void) {
 		if(d < -8192) d += 16384;
 		enc_pos += d;
 	} else { enc_pos = raw; enc_have = true; }
+	if(velocity_have) {
+		int32_t vd = (int32_t)raw - velocity_prev;
+		if(vd > 8192) vd -= 16384;
+		if(vd < -8192) vd += 16384;
+		float instant = (float)vd * (TWO_PI / 16384.f) * 1000.f;
+		float alpha = state == STATE_SPRING ? 0.31415927f : state == STATE_GEAR ? 0.50265482f : 0.75398224f;
+		velocity += clampf(alpha, 0.f, 1.f) * (instant - velocity);
+	} else velocity_have = true;
+	velocity_prev = raw;
 	enc_prev = raw;
 	return true;
 }
@@ -433,9 +570,8 @@ static void process_adc_sample(void) {
 	/* Match the RP2350 validated CS_PHASE_ORD=4 (CAB). */
 	ia = sc; ib = sa; ic = sb;
 	vbus = (float)raw[3] * ADC_TO_V * 10.f;
-	float theta_m = (float)enc_pos * (TWO_PI / 16384.f);
-	float te = (float)motor_dir * theta_m * (float)MOTOR_POLE_PAIRS + electrical_offset - 0.70f;
-	uint8_t index = (uint8_t)(te * (256.f / TWO_PI));
+	uint32_t park_phase = encoder_electrical_phase() + phase_from_rad(-0.70f);
+	uint8_t index = (uint8_t)(park_phase >> 24);
 	float sn = sin_lut[index], cs = sin_lut[(uint8_t)(index + 64u)];
 	float alpha = ia;
 	float beta = (ia + 2.f * ib) * 0.57735026919f;
@@ -463,17 +599,21 @@ static void process_adc_sample(void) {
 		}
 		id_integral = clampf(id_integral + CUR_KAW * (ud_out - ud_raw) * dt, -CUR_U_MAX, CUR_U_MAX);
 		iq_integral = clampf(iq_integral + CUR_KAW * (uq_out - uq_raw) * dt, -CUR_U_MAX, CUR_U_MAX);
-		apply_voltage(ud_out, uq_out, phase_from_rad(te));
+		apply_voltage(ud_out, uq_out, encoder_electrical_phase());
 	}
 }
 
 static uint8_t protocol_mode(void) {
 	if(state == STATE_FAULT) return 8;
-	if(state == STATE_TEST_FWD || state == STATE_TEST_PAUSE_FWD ||
-			state == STATE_TEST_REV || state == STATE_TEST_PAUSE_REV)
+	if(state == STATE_SPRING) return 6;
+	if(state == STATE_SPIN) return 7;
+	if(state == STATE_POS) return 9;
+	if(state == STATE_STRESS) return 10;
+	if(state == STATE_GEAR) return 12;
+	if(state == STATE_TEST_FWD || state == STATE_TEST_REV)
 		return 5;
 	if(state == STATE_DIR_PULSE) return 3;
-	if(state == STATE_VERIFY || state == STATE_CALIBRATE || state == STATE_ALIGN || state == STATE_TEST_ALIGN)
+	if(state == STATE_VERIFY || state == STATE_CALIBRATE || state == STATE_ALIGN)
 		return 2;
 	return 0;
 }
@@ -533,25 +673,39 @@ __attribute__((noreturn)) static void enter_system_dfu(void) {
 	for(;;) {}
 }
 
-static uint8_t vendor_command(uint8_t cmd) {
+static bool mode_allowed(void) { return aligned && state != STATE_FAULT && state != STATE_VERIFY && state != STATE_CALIBRATE && state != STATE_ALIGN && state != STATE_DIR_PULSE; }
+
+static int32_t get_i32_le(uint8_t const *p) {
+	return (int32_t)((uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24);
+}
+
+static uint8_t vendor_command(uint8_t const *packet, uint32_t n) {
+	uint8_t cmd = packet[0];
 	if(cmd == 0x02) {
-		outputs_off(); current_control = false; current_reset(); state = STATE_DISABLED; fault_reason[0] = 0;
+		outputs_off(); current_control = false; current_reset(); state = aligned ? STATE_READY : STATE_DISABLED; fault_reason[0] = 0;
 		return 1;
 	}
 	if(cmd == 0x01) {
-		outputs_off(); verify_good = 0; fault_reason[0] = 0;
+		outputs_off(); aligned = false; current_control = false; current_reset(); verify_good = 0; fault_reason[0] = 0;
 		adc_offset_n = 0; memset(adc_offset_sum, 0, sizeof(adc_offset_sum)); state = STATE_VERIFY;
 		return 1;
 	}
-	if(cmd == 0x05) {
-		if(state != STATE_READY) return 0;
-		home_pos = enc_pos; move_start = enc_pos; move_target = enc_pos + 16384;
-		test_forward = true; current_reset(); current_control = true;
-		state = STATE_TEST_FWD; state_ticks = 0;
-		motion_pos0 = enc_pos; motion_ms0 = milliseconds; outputs_on();
-		return 1;
-	}
 	if(cmd == 0x30) return 1;
+	if(!mode_allowed()) return 0;
+	if(cmd == 0x03) { rest_pos = enc_pos; state_ticks = 0; state = STATE_SPRING; outputs_on(); return 1; }
+	if(cmd == 0x04) { state_ticks = 0; state = STATE_SPIN; outputs_on(); return 1; }
+	if(cmd == 0x05) {
+		home_pos = enc_pos; move_start = enc_pos; move_target = enc_pos + 16384;
+		test_forward = true; current_reset(); current_control = true; state = STATE_TEST_FWD; state_ticks = 0;
+		motion_pos0 = enc_pos; motion_ms0 = milliseconds; outputs_on(); return 1;
+	}
+	if(cmd == 0x06 && n >= 5u) {
+		track_pos = (int32_t)((float)get_i32_le(&packet[1]) / ((TWO_PI / 16384.f) * 1000.f));
+		track_velocity = n >= 9u ? (float)get_i32_le(&packet[5]) / 1000.f : 0.f;
+		current_reset(); current_control = true; state = STATE_POS; state_ticks = 0; outputs_on(); return 1;
+	}
+	if(cmd == 0x07) { stress_phase = 0; state_ticks = 0; state = STATE_STRESS; outputs_on(); return 1; }
+	if(cmd == 0x0a) { gear_center = (float)enc_pos; gear_prev_progress = 0.f; gear_click_ticks = 0; state_ticks = 0; state = STATE_GEAR; outputs_on(); return 1; }
 	return 0;
 }
 
@@ -600,7 +754,8 @@ static void vendor_task(void) {
 		if(n && packet[0] == 0x7f) enter_system_dfu();
 		if(n) {
 			ack_cmd = packet[0];
-			ack_status = vendor_command(ack_cmd);
+			ack_status = vendor_command(packet, n);
+			if(ack_cmd == 0x06 && ack_status) { ack_pending = false; return; }
 			diag_after_ack = ack_cmd == 0x30 && ack_status;
 			ack_pending = true;
 		}
@@ -632,7 +787,6 @@ int main(void) {
 	for(;;) {
 		tud_task();
 		vendor_task();
-		process_adc_sample();
 		uint32_t now = milliseconds;
 		if(now != sample_ms) {
 			sample_ms = now;
